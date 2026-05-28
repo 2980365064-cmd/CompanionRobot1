@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SparkBot Agent 测试台</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --surface2: #242836;
+      --border: #2e3348;
+      --text: #e8eaef;
+      --muted: #8b92a8;
+      --accent: #6c9eff;
+      --accent-dim: #4a7ad4;
+      --user-bg: #2a3550;
+      --bot-bg: #1e2433;
+      --ok: #5dd39e;
+      --err: #ff7b7b;
+      --radius: 12px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "DM Sans", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+    }
+    aside {
+      width: 280px;
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      flex-shrink: 0;
+    }
+    aside h1 {
+      font-size: 1.1rem;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+    }
+    aside .sub {
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-top: -8px;
+    }
+    label {
+      display: block;
+      font-size: 0.75rem;
+      color: var(--muted);
+      margin-bottom: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    input, select, textarea {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      padding: 10px 12px;
+      font-family: inherit;
+      font-size: 0.9rem;
+    }
+    input:focus, select:focus, textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    .row { display: flex; gap: 8px; }
+    .row button { flex: 1; }
+    button {
+      background: var(--accent);
+      color: #0a0e17;
+      border: none;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-family: inherit;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    button:hover { background: #8bb4ff; }
+    button.secondary {
+      background: var(--surface2);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    button.secondary:hover { background: var(--border); }
+    button.danger {
+      background: transparent;
+      color: var(--err);
+      border: 1px solid var(--err);
+    }
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.8rem;
+      padding: 10px 12px;
+      background: var(--surface2);
+      border-radius: 8px;
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--muted);
+    }
+    .dot.ok { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+    .dot.err { background: var(--err); }
+    .session-id {
+      font-size: 0.7rem;
+      color: var(--muted);
+      word-break: break-all;
+      line-height: 1.4;
+    }
+    main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .msg {
+      max-width: 85%;
+      padding: 12px 16px;
+      border-radius: var(--radius);
+      line-height: 1.55;
+      font-size: 0.95rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .msg.user {
+      align-self: flex-end;
+      background: var(--user-bg);
+      border-bottom-right-radius: 4px;
+    }
+    .msg.bot {
+      align-self: flex-start;
+      background: var(--bot-bg);
+      border: 1px solid var(--border);
+      border-bottom-left-radius: 4px;
+    }
+    .msg.system {
+      align-self: center;
+      background: transparent;
+      color: var(--muted);
+      font-size: 0.8rem;
+      padding: 4px 12px;
+    }
+    .msg .meta {
+      font-size: 0.7rem;
+      color: var(--muted);
+      margin-top: 6px;
+    }
+    .composer {
+      padding: 16px 24px 24px;
+      border-top: 1px solid var(--border);
+      background: var(--surface);
+    }
+    .composer-inner {
+      display: flex;
+      gap: 12px;
+      align-items: flex-end;
+      max-width: 900px;
+      margin: 0 auto;
+    }
+    #input {
+      flex: 1;
+      min-height: 48px;
+      max-height: 160px;
+      resize: vertical;
+    }
+    #sendBtn {
+      height: 48px;
+      padding: 0 24px;
+      flex-shrink: 0;
+    }
+    #sendBtn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    @media (max-width: 768px) {
+      body { flex-direction: column; }
+      aside { width: 100%; border-right: none; border-bottom: 1px solid var(--border); }
+    }
+  </style>
+</head>
+<body>
+  <aside>
+    <div>
+      <h1>SparkBot 测试台</h1>
+      <p class="sub">私人 Agent · 三层记忆</p>
+    </div>
+
+    <div class="status">
+      <span class="dot" id="statusDot"></span>
+      <span id="statusText">未连接服务</span>
+    </div>
+    <div class="status" style="margin-top:-8px">
+      <span class="dot" id="llmDot"></span>
+      <span id="llmText">DeepSeek 检测中…</span>
+    </div>
+    <div class="status" style="margin-top:-8px">
+      <span class="dot" id="embedDot"></span>
+      <span id="embedText">Embedding 检测中…</span>
+    </div>
+
+    <div>
+      <label>连接模式</label>
+      <select id="mode">
+        <option value="http">HTTP（简单稳定）</option>
+        <option value="ws">WebSocket（模拟固件）</option>
+      </select>
+    </div>
+
+    <div>
+      <label>服务地址</label>
+      <input id="baseUrl" type="text" placeholder="http://127.0.0.1:8001" />
+    </div>
+
+    <div>
+      <label>API Token</label>
+      <input id="apiToken" type="password" placeholder="dev-token" />
+    </div>
+
+    <div>
+      <label>Device ID</label>
+      <input id="deviceId" type="text" value="web-tester" />
+    </div>
+
+    <div class="row">
+      <button type="button" id="connectBtn">连接</button>
+      <button type="button" class="secondary" id="newSessionBtn">新会话</button>
+    </div>
+
+    <p class="session-id" id="sessionLabel">session: —</p>
+
+    <button type="button" class="danger secondary" id="clearBtn">清空对话</button>
+  </aside>
+
+  <main>
+    <div id="messages">
+      <div class="msg system">配置左侧参数后点击「连接」，开始测试你的私人 Agent。</div>
+    </div>
+    <div class="composer">
+      <div class="composer-inner">
+        <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行…" disabled></textarea>
+        <button type="button" id="sendBtn" disabled>发送</button>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    const state = {
+      connected: false,
+      mode: "http",
+      baseUrl: "",
+      token: "",
+      deviceId: "web-tester",
+      sessionId: "",
+      ws: null,
+      sending: false,
+    };
+
+    function defaultBaseUrl() {
+      const { protocol, host } = window.location;
+      return `${protocol}//${host}`;
+    }
+
+    function setLlmStatus(ok, text) {
+      $("llmDot").className = "dot" + (ok ? " ok" : ok === false ? " err" : "");
+      $("llmText").textContent = text;
+    }
+
+    function setEmbedStatus(ok, text) {
+      $("embedDot").className = "dot" + (ok ? " ok" : ok === false ? " err" : "");
+      $("embedText").textContent = text;
+    }
+
+    async function checkLlmStatus() {
+      const base = ($("baseUrl").value.trim() || defaultBaseUrl()).replace(/\/$/, "");
+      try {
+        const r = await fetch(`${base}/health`);
+        if (!r.ok) throw new Error("服务未启动或地址错误");
+        const data = await r.json();
+        const llm = data.llm || {};
+        if (llm.configured) {
+          setLlmStatus(true, `DeepSeek 就绪 · ${llm.model || "deepseek-chat"}`);
+        } else {
+          setLlmStatus(false, "DeepSeek 未配置 Key");
+          addSystem("已在 .env 填写 Key？请重启 uvicorn 后再点「连接」。旧进程不会自动加载新配置。");
+        }
+        const embed = data.embed || {};
+        if (embed.configured) {
+          const label = embed.provider === "aliyun_dashscope" ? "阿里云" : embed.provider;
+          setEmbedStatus(true, `${label} Embedding · ${embed.model || "text-embedding-v3"}`);
+        } else {
+          setEmbedStatus(false, "Embedding 未配置（本地 fallback）");
+        }
+        return data;
+      } catch (e) {
+        setLlmStatus(false, "无法访问服务");
+        setEmbedStatus(false, "—");
+        addSystem(`无法连接 ${base}：${e.message}。请先运行: uvicorn app.main:app --port 8001`);
+        return null;
+      }
+    }
+
+    function wsUrlFromBase(base) {
+      const u = new URL(base);
+      u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
+      u.pathname = "/ws/v1/chat";
+      u.search = "";
+      u.hash = "";
+      return u.toString();
+    }
+
+    function setStatus(ok, text) {
+      $("statusDot").className = "dot" + (ok ? " ok" : ok === false ? " err" : "");
+      $("statusText").textContent = text;
+    }
+
+    function addMessage(role, text, meta = "") {
+      const el = document.createElement("div");
+      el.className = "msg " + role;
+      const body = document.createElement("div");
+      body.textContent = text;
+      el.appendChild(body);
+      if (meta) {
+        const m = document.createElement("div");
+        m.className = "meta";
+        m.textContent = meta;
+        el.appendChild(m);
+      }
+      $("messages").appendChild(el);
+      $("messages").scrollTop = $("messages").scrollHeight;
+    }
+
+    function addSystem(text) {
+      addMessage("system", text);
+    }
+
+    function updateSessionLabel() {
+      $("sessionLabel").textContent = state.sessionId
+        ? `session: ${state.sessionId}`
+        : "session: —";
+    }
+
+    function setComposerEnabled(on) {
+      $("input").disabled = !on;
+      $("sendBtn").disabled = !on || state.sending;
+    }
+
+    function loadSettings() {
+      const saved = JSON.parse(localStorage.getItem("sparkbot-test") || "{}");
+      $("baseUrl").value = saved.baseUrl || defaultBaseUrl();
+      $("apiToken").value = saved.apiToken || "dev-token";
+      $("deviceId").value = saved.deviceId || "web-tester";
+      $("mode").value = saved.mode || "http";
+    }
+
+    function saveSettings() {
+      localStorage.setItem("sparkbot-test", JSON.stringify({
+        baseUrl: $("baseUrl").value.trim(),
+        apiToken: $("apiToken").value,
+        deviceId: $("deviceId").value.trim(),
+        mode: $("mode").value,
+      }));
+    }
+
+    async function connectHttp() {
+      const base = state.baseUrl.replace(/\/$/, "");
+      const data = await checkLlmStatus();
+      if (!data) throw new Error("后端服务不可达");
+      if (!data.llm?.configured) {
+        throw new Error("DeepSeek API Key 未生效，请重启 uvicorn 后重试");
+      }
+      state.connected = true;
+      setStatus(true, "HTTP 已连接");
+      setComposerEnabled(true);
+      if (data.embed?.configured) {
+        addSystem("已连接。RAG 使用阿里云 DashScope 向量。");
+      } else {
+        addSystem("已连接。未配置 EMBED_API_KEY，RAG 为本地 fallback；正式使用请在 .env 填阿里云 Key 后执行 python scripts/ingest.py");
+      }
+    }
+
+    function connectWs() {
+      return new Promise((resolve, reject) => {
+        const url = wsUrlFromBase(state.baseUrl);
+        const ws = new WebSocket(url);
+        state.ws = ws;
+
+        ws.onopen = () => {
+          ws.send(JSON.stringify({
+            type: "hello",
+            device_id: state.deviceId,
+            token: state.token,
+            session_id: state.sessionId || "",
+          }));
+        };
+
+        ws.onmessage = (ev) => {
+          let data;
+          try { data = JSON.parse(ev.data); } catch { return; }
+
+          if (data.type === "hello_ack") {
+            state.sessionId = data.session_id || "";
+            updateSessionLabel();
+            state.connected = true;
+            setStatus(true, "WebSocket 已连接");
+            setComposerEnabled(true);
+            addSystem("WebSocket 握手成功，可开始对话。");
+            resolve();
+          } else if (data.type === "reply") {
+            state.sessionId = data.session_id || state.sessionId;
+            updateSessionLabel();
+            addMessage("bot", data.text || "");
+            state.sending = false;
+            setComposerEnabled(true);
+          } else if (data.type === "error") {
+            addSystem(`错误: ${data.message || data.code}`);
+            state.sending = false;
+            setComposerEnabled(true);
+          } else if (data.type === "pong") {
+            /* ignore */
+          }
+        };
+
+        ws.onerror = () => reject(new Error("WebSocket 连接失败"));
+        ws.onclose = () => {
+          if (state.connected) {
+            state.connected = false;
+            setStatus(false, "连接已断开");
+            setComposerEnabled(false);
+            addSystem("WebSocket 连接已关闭。");
+          }
+        };
+
+        setTimeout(() => {
+          if (!state.connected) reject(new Error("WebSocket 握手超时"));
+        }, 10000);
+      });
+    }
+
+    async function connect() {
+      saveSettings();
+      state.baseUrl = $("baseUrl").value.trim() || defaultBaseUrl();
+      state.token = $("apiToken").value;
+      state.deviceId = $("deviceId").value.trim() || "web-tester";
+      state.mode = $("mode").value;
+
+      setStatus(null, "连接中…");
+      $("connectBtn").disabled = true;
+
+      try {
+        if (state.ws) {
+          state.ws.close();
+          state.ws = null;
+        }
+        if (state.mode === "ws") {
+          await connectWs();
+        } else {
+          await connectHttp();
+        }
+      } catch (e) {
+        setStatus(false, "连接失败");
+        addSystem(String(e.message || e));
+        state.connected = false;
+        setComposerEnabled(false);
+      } finally {
+        $("connectBtn").disabled = false;
+      }
+    }
+
+    async function sendHttp(text) {
+      const base = state.baseUrl.replace(/\/$/, "");
+      const r = await fetch(`${base}/v1/chat`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-API-Token": state.token,
+        },
+        body: JSON.stringify({
+          device_id: state.deviceId,
+          session_id: state.sessionId,
+          message: text,
+        }),
+      });
+      if (!r.ok) {
+        let detail = await r.text();
+        try { detail = JSON.parse(detail).detail || detail; } catch (_) {}
+        throw new Error(detail || `HTTP ${r.status}`);
+      }
+      const data = await r.json();
+      state.sessionId = data.session_id || state.sessionId;
+      updateSessionLabel();
+      addMessage("bot", data.reply || "");
+    }
+
+    function sendWs(text) {
+      state.ws.send(JSON.stringify({ type: "chat", message: text }));
+    }
+
+    async function sendMessage() {
+      const text = $("input").value.trim();
+      if (!text || !state.connected || state.sending) return;
+
+      addMessage("user", text);
+      $("input").value = "";
+      state.sending = true;
+      setComposerEnabled(false);
+
+      try {
+        if (state.mode === "ws") {
+          sendWs(text);
+        } else {
+          await sendHttp(text);
+          state.sending = false;
+          setComposerEnabled(true);
+        }
+      } catch (e) {
+        addSystem("发送失败: " + (e.message || e));
+        state.sending = false;
+        setComposerEnabled(true);
+      }
+    }
+
+    async function newSession() {
+      if (!state.connected) return;
+      if (state.mode === "ws" && state.ws) {
+        state.ws.send(JSON.stringify({ type: "new_session" }));
+        addSystem("已请求新会话，等待服务器确认…");
+      } else {
+        state.sessionId = "";
+        updateSessionLabel();
+        addSystem("已重置 session（HTTP 下次发送将开新会话）。");
+      }
+    }
+
+    function clearChat() {
+      $("messages").innerHTML = "";
+      addSystem("对话已清空。");
+    }
+
+    $("connectBtn").addEventListener("click", connect);
+    $("newSessionBtn").addEventListener("click", newSession);
+    $("clearBtn").addEventListener("click", clearChat);
+    $("sendBtn").addEventListener("click", sendMessage);
+    $("input").addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+
+  loadSettings();
+  updateSessionLabel();
+  (async () => {
+    await checkLlmStatus();
+    if ($("mode").value === "http") {
+      try { await connect(); } catch (e) { /* 页面上已有错误提示 */ }
+    }
+  })();
+  </script>
+</body>
+</html>

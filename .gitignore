@@ -1,0 +1,31 @@
+# Personal data - never commit
+data/
+persona/import/
+persona/style/examples_intimate.md
+persona/corpus/*.md
+personal-agent-backend/data/
+personal-agent-backend/.env
+personal-agent-backend/.env.*
+!personal-agent-backend/.env.example
+personal-agent-backend/chroma_data/
+personal-agent-backend/es_data/
+personal-agent-backend/*.db
+personal-agent-backend/agent.db
+personal-agent-backend/*.sqlite
+personal-agent-backend/*.sqlite3
+personal-agent-backend/*.log
+personal-agent-backend/.pytest_cache/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ESP-IDF
+esp_sparkbot/example/factory_demo_v1/build/
+esp_sparkbot/example/factory_demo_v1/sdkconfig
+esp_sparkbot/example/factory_demo_v1/sdkconfig.old
+
+# IDE
+.idea/
