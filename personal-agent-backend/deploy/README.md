@@ -12,7 +12,7 @@
 cd personal-agent-backend
 cp .env.example .env   # edit keys
 docker compose up -d --build
-curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8001/health
 ```
 
 ## 3. nginx + Let's Encrypt (wss)

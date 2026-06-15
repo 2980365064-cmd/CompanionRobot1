@@ -1,4 +1,32 @@
-"""L1→L2 compression, L2→L3 rollup, optional fact extraction."""
+"""
+L1→L2 压缩与会话收尾 —— 记忆系统的时间维度转换引擎。
+
+============================================================================
+在陪伴型情感机器人记忆体系中的角色：
+  Extractor 是"记忆压缩机"——负责将短期消息（L1）转化为中期摘要（L2），
+  再在过期时将 L2 归档为长期语料（L3）。
+
+数据流全景图：
+  ┌──────────┐  满 N 轮压缩    ┌──────────┐  7天后过期     ┌──────────┐
+  │  L1 消息  │ ───────────→   │  L2 摘要  │ ──────────→   │  L3 语料  │
+  │ (messages)│ compress_l1_to │(episodic) │ rollup_expired │ (chunks)  │
+  └──────────┘     _l2         └──────────┘   _l2           └──────────┘
+       ↑                           │
+       │      consolidate_session  │  会话收尾
+       └───────────────────────────┘
+
+四个核心函数：
+  1. compress_l1_to_l2    —— L1 满 N 轮时，最老一批消息 LLM 摘要写入 L2
+  2. consolidate_session   —— 会话结束时，剩余 L1 全量压缩 + 画像转正尝试
+  3. rollup_expired_l2     —— 定时任务：过期 L2（>7天）→ L3 叙述块归档
+  4. ingest_remember_to_l3 —— 用户"记住"意图：对话原文直接写入 L3
+
+关键设计：
+  - 访客模式不压缩（仅已实名用户产生活动记录）
+  - L2 摘要含 4 个维度：summary（文本）/ topics（主题）/ open_loops（待办）/ emotion（情感）
+  - 会话收尾后还会尝试 L0 提取（由 agent 异步调用 extract_l0_from_session_summary）
+============================================================================
+"""
 
 from __future__ import annotations
 
@@ -9,42 +37,75 @@ from collections import defaultdict
 
 from app.config import settings
 from app.llm import chat_completion
-from app.memory.episodic import episodic_memory
-from app.memory.semantic import semantic_memory
+from app.memory.l2 import episodic_memory
 from app.session import store
 
 logger = logging.getLogger(__name__)
 
 
 def _format_transcript(messages: list[dict]) -> str:
+    """将消息字典列表格式化为 LLM 可读的对话文本。
+
+    格式：每行一条 `role: content`，按时间正序排列。
+    """
     return "\n".join(f"{m['role']}: {m['content']}" for m in messages)
 
 
+# LLM 摘要指令：要求 LLM 生成 4 维度的 L2 摘要
+# 包含 summary（150~280 字叙述）、topics（逗号分隔主题）、
+# open_loops（未完结事项数组）、emotion（情感快照 JSON）
+_L2_SUMMARY_INSTRUCTION = """将以下对话压缩为 **L2 短期记忆**（近 7 天可查，比 L3 更细）。
+
+要求：
+- summary：150～280 字，写清时间线、谁说了什么、情绪、决定、待办、对方自称/关系（若有）
+- topics：逗号分隔主题
+- open_loops：未完结事项数组，无则 []
+- emotion：从以下值选取 — mood 取 平静/开心/低落/焦虑/难过/生气/兴奋/疲惫/烦躁/害怕/轻松/期待；intensity 取 0.0~1.0（强度）；trigger 为情绪诱因（无则空字符串）；attitude 为用户对助手的互动态度 倾诉/依赖/敷衍/调侃/冷淡/亲密/求助（无则空字符串）
+
+只输出 JSON：{{"summary":"...","topics":"...","open_loops":[],"emotion":{{"mood":"平静","intensity":0.3,"trigger":"","attitude":""}}}}"""
+
+
 def compress_l1_to_l2(device_id: str, session_id: str) -> bool:
-    """When L1 >= working_memory_turns, compress oldest batch into L2 only."""
+    """L1 满 working_memory_turns 轮时：将最老一批消息 LLM 摘要后写入 L2 并删除原消息。
+
+    触发条件：当前会话对话轮数 >= working_memory_turns。
+    每次压缩 l1_compress_batch_turns 轮的消息（最老一批），不做全部压缩，
+    保留最近的消息在 L1 中继续使用。
+
+    压缩流程：
+      1. 检查轮数是否达到阈值
+      2. 取最老 l1_compress_batch_turns × 2 条消息（每轮 user+assistant）
+      3. 格式化为对话文本 → LLM 生成四维 L2 摘要
+      4. 解析 JSON → 写入 episodic_memory（附带 emotion JSON）
+      5. 删除已压缩的原始消息
+
+    Args:
+        device_id:  设备标识
+        session_id: 会话标识
+
+    Returns:
+        True 表示成功压缩了一批消息，False 表示未达到阈值或压缩失败。
+    """
     turns = store.count_turns(session_id)
     if turns < settings.working_memory_turns:
         return False
 
     batch = settings.l1_compress_batch_turns
-    msg_limit = batch * 2
+    msg_limit = batch * 2  # 每轮 2 条消息
     oldest = store.get_oldest_messages(session_id, msg_limit)
-    if len(oldest) < 4:
+    if len(oldest) < 4:  # 至少够 2 轮才有压缩意义
         return False
 
+    # 构建 LLM 摘要请求
     transcript = _format_transcript(oldest)
-    prompt = f"""将以下对话压缩为结构化摘要（中文 JSON），用于短期记忆，100～200字。
-
-字段：
-- summary: 一段话摘要（时间、决定、情绪、关键事实）
-- topics: 逗号分隔主题词
-- open_loops: 未说完/待跟进事项数组，无则 []
+    prompt = f"""{_L2_SUMMARY_INSTRUCTION}
 
 对话：
-{transcript}
-
-只输出 JSON：{{"summary":"...","topics":"...","open_loops":[]}}"""
+{transcript}"""
     raw = chat_completion([{"role": "user", "content": prompt}], temperature=0.2)
+
+    # 安全解析 JSON（容错：提取第一个 {...} 块）
+    # LLM 偶尔会在 JSON 前后加解释文字，用 re 提取 {} 可绕过这种噪声
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     if not match:
         return False
@@ -54,172 +115,219 @@ def compress_l1_to_l2(device_id: str, session_id: str) -> bool:
         return False
 
     summary = str(data.get("summary", "")).strip()
-    if not summary:
+    if not summary:  # LLM 没生成摘要 → 不压缩（不删除原始消息，下次再试）
         return False
 
     topics = str(data.get("topics", ""))
     loops = data.get("open_loops", [])
     open_loops = json.dumps(loops, ensure_ascii=False) if loops else ""
+    emotion = json.dumps(data.get("emotion") or {}, ensure_ascii=False)
 
-    episodic_memory.save_summary(device_id, session_id, summary, topics, open_loops)
+    # 写入 L2 情景记忆（附带 emotion JSON 字段，供情感轨迹查询）
+    person_id = store.get_session_active_person_id(session_id) or ""
+    episodic_memory.save_summary(
+        device_id, person_id, session_id, summary, topics, open_loops, emotion=emotion
+    )
+    # 删除已压缩的原始 L1 消息（释放 messages 表存储空间）
+    # 压缩是"移出"操作：L1 → L2，原消息不再需要
     store.delete_messages_by_ids([m["id"] for m in oldest])
     logger.debug("L1→L2 compressed %d messages for session=%s", len(oldest), session_id)
     return True
 
 
-def consolidate_session(device_id: str, session_id: str) -> None:
-    """Session end: compress any remaining L1 into L2."""
+def consolidate_session(device_id: str, session_id: str) -> str:
+    """会话结束时的收尾操作：剩余 L1 全量压缩 + 画像转正尝试 + 清空 messages。
+
+    这是会话生命周期的终结点，执行以下操作：
+      1. 访客检查：非实名用户直接 finalize 并返回空摘要
+      2. 循环压缩：将所有剩余 L1 消息逐批压入 L2
+      3. 尾批压缩：取最后 40 条消息生成最终 L2 摘要（避免碎片化）
+      4. 画像转正：尝试将临时 draft 画像确认为正式画像
+      5. 清空 messages 表（释放 L1 存储）
+
+    Args:
+        device_id:  设备标识
+        session_id: 会话标识
+
+    Returns:
+        生成的 L2 摘要文本（用于后续 L0 提取）；无摘要时返回空字符串。
+    """
+    from app.memory.identity import is_verified_person_id
+
+    person_id = store.get_session_active_person_id(session_id) or ""
+    # 访客模式：不压缩，直接结束
+    if not is_verified_person_id(person_id):
+        store.finalize_session(session_id)
+        return ""
+
+    # 阶段 1：循环压缩所有超量 L1 消息到 L2
+    # 为什么要循环：会话可能有几百条消息，单次 compress_l1_to_l2
+    # 只压缩最老的 batch 条，需要多次迭代才能将所有超量消息写入 L2。
+    if person_id:
+        while store.count_turns(session_id) >= settings.working_memory_turns:
+            if not compress_l1_to_l2(device_id, session_id):
+                break
+
+    # 阶段 2：尾批最终摘要——取最后最多 40 条消息生成最终 L2 摘要。
+    # 即使 L1 总量不足一次压缩阈值（<20 轮），会话结束时也要生成摘要，
+    # 否则这些对话内容会随着 finalize 被丢弃，丧失中间记忆。
     messages = store.get_session_messages(session_id)
-    if len(messages) < 2:
-        store.close_session(session_id)
-        return
+    l2_summary = ""
 
-    transcript = _format_transcript(messages[-40:])
-    prompt = f"""将以下对话压缩为结构化摘要（中文 JSON）。
+    if person_id and len(messages) >= 1:
+        transcript = _format_transcript(messages[-40:])
+        prompt = f"""{_L2_SUMMARY_INSTRUCTION}
 
-字段：summary（100～200字）、topics（逗号分隔）、open_loops（数组，无则[]）
+{transcript}"""
+        raw = chat_completion([{"role": "user", "content": prompt}], temperature=0.2)
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group())
+                l2_summary = str(data.get("summary", "")).strip()
+                if l2_summary:
+                    topics = str(data.get("topics", ""))
+                    loops = data.get("open_loops", [])
+                    open_loops = json.dumps(loops, ensure_ascii=False) if loops else ""
+                    emotion = json.dumps(data.get("emotion") or {}, ensure_ascii=False)
+                    episodic_memory.save_summary(
+                        device_id, person_id, session_id, l2_summary, topics, open_loops, emotion=emotion
+                    )
+            except json.JSONDecodeError:
+                pass
 
-{transcript}
+    # 阶段 3：画像转正确认（仅在会话结束时触发）
+    # 如果画像是 draft/provisional 状态且会话中有实质内容（如关系声明、
+    # 人物事实等），则尝试转正。为什么在会话结束时而非每轮都触发：
+    # 画像转正是"审核"操作，应该累积足够证据后再判断，避免碎片化决策。
+    if person_id:
+        raw = store.get_person_profile(person_id)
+        if raw and raw.get("provisional"):
+            from app.memory.profile import try_promote_provisional_profile
 
-只输出 JSON。"""
-    raw = chat_completion([{"role": "user", "content": prompt}], temperature=0.2)
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if match:
-        try:
-            data = json.loads(match.group())
-            summary = str(data.get("summary", "")).strip()
-            if summary:
-                topics = str(data.get("topics", ""))
-                loops = data.get("open_loops", [])
-                open_loops = json.dumps(loops, ensure_ascii=False) if loops else ""
-                episodic_memory.save_summary(device_id, session_id, summary, topics, open_loops)
-        except json.JSONDecodeError:
-            pass
+            try_promote_provisional_profile(device_id, person_id, raw)
 
-    store.close_session(session_id)
+    # 清空会话消息，标记会话结束
+    store.finalize_session(session_id)
+    return l2_summary
 
 
 def rollup_expired_l2(device_id: str | None = None) -> int:
-    """Expired L2 → L3: narrative chunks (corpus) + facts. Returns count rolled up."""
+    """定时任务：将过期 L2 摘要（>7 天）归档为 L3 语料块。
+
+    按 person_id 分组处理，每组调用 rollup_l2_rows_to_corpus 批量写入 L3。
+    归档成功后调用 archive_episodic 标记原 L2 记录为已归档（不再参与检索）。
+
+    Args:
+        device_id: 可选，指定设备（None 表示所有设备）
+
+    Returns:
+        成功归档的 L2 记录条数。
+    """
+    from app.memory.l3 import rollup_l2_rows_to_corpus
+
     rows = store.list_expired_episodic(device_id)
     if not rows:
         return 0
 
-    by_device: dict[str, list[dict]] = defaultdict(list)
+    # 按 person_id 分组，避免跨用户数据混写
+    # L3 语料是按 person_id 分区的，同一人的多天摘要可以合并成一个叙述块
+    by_person: dict[str, list[dict]] = defaultdict(list)
     for row in rows:
-        by_device[row["device_id"]].append(row)
+        pid = str(row.get("person_id") or "").strip()
+        by_person[pid].append(row)
 
     rolled = 0
-    for dev_id, items in by_device.items():
+    for person_id, items in by_person.items():
+        dev_id = str(items[0].get("device_id") or "")
         try:
-            _rollup_device_batch(dev_id, items)
+            # rollup_l2_rows_to_corpus 将多条 L2 摘要 LLM 加工成连贯的 L3 叙述块
+            rollup_l2_rows_to_corpus(dev_id, person_id, items)
+            # 归档成功后标记原 L2 记录已归档（不再参与 L2 检索，但保留审计记录）
             store.archive_episodic([int(r["id"]) for r in items])
             rolled += len(items)
         except Exception as exc:
-            logger.warning("L2→L3 rollup failed device=%s: %s", dev_id, exc)
+            # 单组失败不影响其他组：按 person 隔离异常
+            logger.warning("L2→Corpus rollup failed person=%s: %s", person_id, exc)
     return rolled
 
 
-def _rollup_device_batch(device_id: str, items: list[dict]) -> None:
-    block = "\n\n".join(
-        f"[{r.get('created_at', '')}] {r['summary']}"
-        + (f" 主题:{r['topics']}" if r.get("topics") else "")
-        for r in items
-    )
-    prompt = f"""以下是一批已过期（7天+）的短期会话摘要，请汇总为可长期检索的记忆。
+def ingest_remember_to_l3(device_id: str, session_id: str, user_msg: str, assistant_msg: str) -> None:
+    """用户明确说"记住"时：将对话原文直接写入 L3 长期记忆。
 
-输出 JSON：
-{{
-  "narrative": "200～400字叙述性段落，保留时间线、人物、决定、情绪",
-  "facts": [
-    {{"fact":"短句事实","category":"preference|event|person|general","confidence":0.0-1.0}}
-  ]
-}}
+    触发条件：用户消息中包含"记住/别忘了/以后要/帮我记"等关键词。
+    访客模式不写入（仅已实名用户可存储长期记忆）。
 
-规则：
-- facts 只写明确、可验证的信息，无则 []
-- 不要编造摘要里没有的内容
+    写入格式：
+      用户：{用户原话}
+      助手：{助手回复}
 
-摘要列表：
-{block}"""
-
-    raw = chat_completion([{"role": "user", "content": prompt}], temperature=0.2)
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if not match:
-        return
-    try:
-        data = json.loads(match.group())
-    except json.JSONDecodeError:
-        return
-
-    narrative = str(data.get("narrative", "")).strip()
-    if narrative:
-        from datetime import datetime, timezone
-
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d")
-        chunk_id = f"l2-rollup-{device_id}-{ts}-{abs(hash(narrative)) % 10**8}"
-        semantic_memory.ingest_chunks(
-            [
-                {
-                    "id": chunk_id,
-                    "text": narrative,
-                    "meta": {"source": "l2_rollup", "device_id": device_id},
-                }
-            ],
-        )
-
-    for item in data.get("facts") or []:
-        if not isinstance(item, dict) or not item.get("fact"):
-            continue
-        conf = float(item.get("confidence", 0.75))
-        if conf < 0.7:
-            continue
-        semantic_memory.add_fact(
-            device_id,
-            str(item["fact"]),
-            str(item.get("category", "general")),
-            conf,
-            "l2_rollup",
-        )
-
-
-def extract_facts(device_id: str, session_id: str, user_msg: str, assistant_msg: str) -> None:
-    """Disabled by default; only runs when auto_extract_facts=True."""
-    if not settings.auto_extract_facts:
-        return
+    Args:
+        device_id:     设备标识
+        session_id:    会话标识
+        user_msg:      用户原始消息
+        assistant_msg: 助手回复内容
+    """
+    # 仅匹配明确记忆意图的消息
     if not re.search(r"记住|别忘了|以后要|帮我记", user_msg):
         return
 
-    prompt = f"""用户是否明确要求记住某事实？若是，返回 JSON 数组，否则 []。
-每项：{{"fact":"...","category":"preference|event|person|general","confidence":0.0-1.0}}
-confidence 仅当用户明确陈述时 >= 0.85
+    from app.memory.l3 import ingest_l3_text
+    from app.memory.identity import is_verified_person_id
 
-用户：{user_msg}
-助手：{assistant_msg}"""
-    raw = chat_completion([{"role": "user", "content": prompt}], temperature=0.2)
-    match = re.search(r"\[.*\]", raw, re.DOTALL)
-    if not match:
+    pid = store.get_session_active_person_id(session_id) or ""
+    if not is_verified_person_id(pid):
         return
-    try:
-        items = json.loads(match.group())
-    except json.JSONDecodeError:
-        return
-    for item in items:
-        if isinstance(item, dict) and item.get("fact"):
-            conf = float(item.get("confidence", 0.0))
-            if conf >= 0.85:
-                semantic_memory.add_fact(
-                    device_id,
-                    str(item["fact"]),
-                    str(item.get("category", "general")),
-                    conf,
-                    session_id,
-                )
+
+    # 将对话上下文一并存储，保持语境完整
+    corpus = f"用户：{user_msg}\n助手：{assistant_msg}"
+    ingest_l3_text(
+        device_id,
+        pid,
+        corpus,
+        source="user_remember_intent",
+        source_session=session_id,
+        category="remember",
+    )
 
 
-def maybe_compress_l1(device_id: str, session_id: str) -> bool:
+def extract_facts(device_id: str, session_id: str, user_msg: str, assistant_msg: str) -> None:
+    """兼容别名：作用等同于 ingest_remember_to_l3。
+
+    供老代码调用路径兼容。
+    """
+    ingest_remember_to_l3(device_id, session_id, user_msg, assistant_msg)
+
+
+def maybe_compress_l1(device_id: str, session_id: str, person_id: str = "") -> bool:
+    """每轮对话后检查：L1 超过阈值时压缩最老批次到 L2。
+
+    优化策略：
+      - 阈值 + 50% 余量才触发，避免每轮都尝试压缩
+      - 例如 threshold=30 时，36 轮才触发，压缩后降至 ~18 轮
+      - 这样每 ~18 轮只需要一次 LLM 调用，而非每轮
+
+    Args:
+        device_id:  设备标识
+        session_id: 会话标识
+        person_id:  用户 ID
+
+    Returns:
+        True 表示至少执行了一次压缩。
+    """
+    from app.memory.identity import is_verified_person_id
+
+    pid = str(person_id or store.get_session_active_person_id(session_id) or "").strip()
+    if not is_verified_person_id(pid):
+        return False
+    threshold = settings.working_memory_turns
+    # 超过阈值 20% 才触发，给压缩留出余量
+    # 例如 threshold=30 → 36 轮触发
+    trigger = threshold + max(6, threshold // 5)
+    if store.count_turns(session_id) < trigger:
+        return False
     did = False
-    while store.count_turns(session_id) >= settings.working_memory_turns:
+    while store.count_turns(session_id) >= threshold:
         if not compress_l1_to_l2(device_id, session_id):
             break
         did = True
