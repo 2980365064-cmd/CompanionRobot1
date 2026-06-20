@@ -160,6 +160,10 @@ def normalize_profile(profile: dict) -> dict:
     p.setdefault("experiences", [])
     p.setdefault("emotional_habit", [])
     p.setdefault("aliases", [])
+    p.setdefault("profile_role", "owner" if not p.get("owner_person_id") else "contact")
+    p.setdefault("owner_person_id", "")
+    p.setdefault("notes", [])
+    p.setdefault("mention_count", 0)
     # confirmed 默认值：非 provisional 且非 draft 版本 → 视为已确认
     p.setdefault("confirmed", not p.get("provisional") and p.get("version") != "draft")
     p.setdefault("created_at", p.get("update_time") or _utc_now())
@@ -222,9 +226,12 @@ def find_profile_by_name(device_id: str, name: str) -> dict | None:
     """在指定设备的所有画像中按名字查找匹配的画像。
 
     用于 identity 模块做名字→画像的模糊匹配。
+    不包含第三方 contact 画像（避免与对话对象混淆）。
     """
     for row in store.list_person_profiles(device_id):
         p = normalize_profile(row["profile"])
+        if str(p.get("profile_role") or "owner") == "contact":
+            continue
         if profile_matches_name(p, name):
             return p
     return None
@@ -526,6 +533,8 @@ def update_all_profiles() -> dict[str, int]:
         pid = str(row.get("person_id") or "")
         device_id = str(row.get("device_id") or "")
         profile = row.get("profile") or {}
+        if str(normalize_profile(profile).get("profile_role") or "owner") == "contact":
+            continue
         if not pid or not normalize_profile(profile).get("confirmed"):
             continue
         if update_profile(device_id, pid):

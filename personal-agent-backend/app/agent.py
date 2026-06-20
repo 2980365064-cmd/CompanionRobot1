@@ -62,23 +62,24 @@ from app.llm import chat_completion_async, chat_completion_small_async, chat_com
 from app.memory.extractor import consolidate_session, extract_facts, maybe_compress_l1
 from app.memory.guard import (
     ANTI_HALLUCINATION_RULES,
-    build_unknown_reply,
     capture_user_stated_facts,
     extract_self_name,
     memory_l3_texts,
-    memory_requires_unknown_reply,
+    memory_miss_level,
     name_in_memory_text,
     should_force_active_topic,
     should_suppress_active_topic,
     user_message_hints,
     validate_active_topic,
 )
+from app.memory.self_state import format_self_state_prompt
 from app.memory.l0 import (
     capture_l0_from_user_message,
     extract_l0_from_session_summary,
     format_l0_block,
 )
 from app.memory.l1 import working_memory
+from app.memory.contacts import format_contacts_prompt_block, process_third_party_from_turn
 from app.memory.correction import try_apply_memory_corrections
 from app.memory.identity import (
     is_guest_bind_failure_hint,
@@ -266,6 +267,15 @@ _GF_SCENE_CASUAL = re.compile(
 )
 
 
+# 中文括号旁白/动作描写，语音场景必须去除（代码层兜底，prompt 已禁止但 LLM 偶尔违反）
+_PAREN_STAGE_RE = re.compile(r"（[^）]*）")
+
+
+def _strip_stage_directions(text: str) -> str:
+    """去除中文括号旁白/动作描写，防止语音朗读时读出括号内容。"""
+    return _PAREN_STAGE_RE.sub("", text).strip()
+
+
 def _gf_scene_hint(message: str) -> str:
     """女友模式本轮风格路由（persona 路由表的代码层提示，避免三种风格混用）。"""
     msg = (message or "").strip()
@@ -386,6 +396,16 @@ def build_messages(
     l0_block = format_l0_block(str(person_id or memory.get("person_id") or ""))
     l0_prefix = f"{l0_block}\n\n" if l0_block else ""
     person_section = f"\n{person_block}\n" if person_block else ""
+    contacts_block = ""
+    if person_id and not memory.get("guest_mode"):
+        contacts_block = format_contacts_prompt_block(
+            device_id,
+            str(person_id),
+            user_message,
+            owner_profile=person_profile,
+        )
+        if contacts_block:
+            contacts_block = f"\n{contacts_block}\n"
 
     # 身份提示（来自 interlocutor / identity 模块）
     identity_hint = str(memory.get("identity_hint") or "").strip()
@@ -517,19 +537,22 @@ def build_messages(
             "\n（注意：当前对象仅本轮自称，与 L3 语料中的其他人名勿混为一谈）"
         )
 
-    # 记忆未命中警告块：L2 和 L3 都没有相关内容时，
-    # 需要在 prompt 中明确告知 LLM 不要编造
+    # 记忆未命中提示：按级别注入不同强度的提示
+    # 不再一刀切禁止——让 LLM 带着 persona 自然回应
+    miss_lv = memory_miss_level(memory)
     memory_miss_block = ""
-    if memory.get("memory_miss"):
-        memory_miss_block = """
-## 记忆未命中（必须执行 · 最高优先级）
-L2/L3 均未检索到与用户问题相关的任何记忆。
-- **绝对禁止**说「想起来了」「我记得」「对对对」「那次」等假装有记忆的词
-- **必须**口语化承认不记得，或请对方补充说明（例：没印象/记忆库里没有/你跟我讲讲）
-- **绝对禁止**编造人名、关系、经历、地点、约定、喜好、日期等任何细节
-- **禁止**用 persona 风格「圆故事」或凭常识瞎编
-- 可保持叶鹏祥口吻，但只能表达「不知道/不记得/请补充」
-"""
+    if miss_lv == 2:
+        memory_miss_block = (
+            "\n## 记忆提示\n"
+            "你翻了一下记忆，对这件事确实没什么印象。"
+            "诚实说不太记得就好，用你自己的口吻——可以追问对方补充，但别编。\n"
+        )
+    elif miss_lv == 1:
+        memory_miss_block = (
+            "\n## 记忆提示\n"
+            "你隐约记得一些相关的，但不太确定。"
+            "可以提一下你记得的部分，不确定的地方坦诚说。\n"
+        )
 
     # 联想记忆块
     related_block = _format_related_block(memory)
@@ -555,6 +578,11 @@ L2/L3 均未检索到与用户问题相关的任何记忆。
     if person_id and not memory.get("guest_mode"):
         emotion_block = format_emotion_prompt(device_id, str(person_id))
 
+    # 自我状态：机器人的当前活动/心情，让机器人能自然分享自己的生活
+    self_state_block = ""
+    if interlocutor_mode == MODE_GIRLFRIEND:
+        self_state_block = format_self_state_prompt()
+
     # 拼装最终的 system prompt
     # 区块顺序经过精心设计：L0（最高优先级）→ 人格 → 反幻觉规则 →
     # 身份信息 → 情绪提示 → 联想记忆 → L2 摘要 → L3 长期记忆 →
@@ -566,8 +594,7 @@ L2/L3 均未检索到与用户问题相关的任何记忆。
 现在是 {now.strftime('%Y年%m月%d日 %H:%M')}（UTC），请据此判断记忆时效，严禁把很久前的事当刚发生的。
 
 {ANTI_HALLUCINATION_RULES}
-{identity_section}{person_section}{emotion_block}
-
+{identity_section}{person_section}{contacts_block}{emotion_block}{self_state_block}
 {related_block}## 近期会话摘要（L2，7天内）
 {episodic_block}
 
@@ -738,30 +765,9 @@ async def handle_chat(device_id: str, session_id: str, message: str) -> tuple[st
     elif identity_hint:
         agent_monitor.event(identity_hint[:48])
 
-    # 记忆未命中：硬回复，不调用主 LLM，杜绝编造
-    if memory_requires_unknown_reply(message, memory):
-        reply = build_unknown_reply(
-            message,
-            interlocutor_mode=ictx.interlocutor_mode,
-            person_profile=person_profile,
-        )
-        reply = enforce_mode_switch_reply(reply, ictx.mode_switch_ack)
-        if len(reply) > settings.max_reply_chars:
-            reply = reply[: settings.max_reply_chars]
-        await asyncio.to_thread(_append_turn, session_id, message, reply)
-        try:
-            agent_monitor.finish_turn(
-                memory, message, reply, t0,
-                person_profile=person_profile, promotion_eval=None,
-            )
-        except Exception as exc:
-            logger.warning("monitor finish_turn failed: %s", exc)
-        asyncio.create_task(
-            _post_process(device_id, session_id, message, reply, memory, person_id)
-        )
-        return reply, session_id, None
-
     # Step 4: 拼装 prompt
+    # 记忆未命中不再是硬阻断——LLM 带着 persona 自然回应，
+    # build_messages 会根据 memory_miss_level 注入不同强度的提示
     messages = build_messages(
         profile, memory, message, device_id=device_id, person_profile=person_profile
     )
@@ -780,6 +786,9 @@ async def handle_chat(device_id: str, session_id: str, message: str) -> tuple[st
 
     # Step 6: 解析 ||| 分隔符，拆分主回复和主动话题
     reply, active_topic = _parse_reply(reply_raw)
+
+    # Step 6.5: 去除括号旁白（代码层兜底，语音场景必须）
+    reply = _strip_stage_directions(reply)
 
     # Step 7: 代码层校验 + 截断
     # 根据用户消息和主回复内容判断是否应该屏蔽主动话题
@@ -883,30 +892,6 @@ async def handle_chat_stream(device_id: str, session_id: str, message: str):
     elif identity_hint:
         agent_monitor.event(identity_hint[:48])
 
-    if memory_requires_unknown_reply(message, memory):
-        reply = build_unknown_reply(
-            message,
-            interlocutor_mode=ictx.interlocutor_mode,
-            person_profile=person_profile,
-        )
-        reply = enforce_mode_switch_reply(reply, ictx.mode_switch_ack)
-        if len(reply) > settings.max_reply_chars:
-            reply = reply[: settings.max_reply_chars]
-        yield ("token", reply)
-        await asyncio.to_thread(_append_turn, session_id, message, reply)
-        try:
-            agent_monitor.finish_turn(
-                memory, message, reply, t0,
-                person_profile=person_profile, promotion_eval=None,
-            )
-        except Exception as exc:
-            logger.warning("monitor finish_turn failed: %s", exc)
-        asyncio.create_task(
-            _post_process(device_id, session_id, message, reply, memory, person_id)
-        )
-        yield ("done", (reply, session_id, None))
-        return
-
     messages = build_messages(
         profile, memory, message, device_id=device_id, person_profile=person_profile
     )
@@ -936,6 +921,9 @@ async def handle_chat_stream(device_id: str, session_id: str, message: str):
 
     reply_raw = "".join(reply_parts).strip()
     reply, active_topic = _parse_reply(reply_raw)
+
+    # 去除括号旁白（代码层兜底，语音场景必须）
+    reply = _strip_stage_directions(reply)
 
     if active_topic and should_suppress_active_topic(message):
         active_topic = None
@@ -1227,6 +1215,22 @@ async def _post_process(
                 )
     except Exception as exc:
         logger.warning("memory correction failed: %s", exc)
+
+    # ---- 第三方人物画像 ----
+    try:
+        if is_verified_person_id(person_id):
+            events = await asyncio.to_thread(
+                process_third_party_from_turn,
+                device_id,
+                person_id or "",
+                user_msg,
+                assistant_msg,
+                owner_profile=store.get_person_profile(person_id or ""),
+            )
+            for ev in events:
+                agent_monitor.event(ev)
+    except Exception as exc:
+        logger.warning("third-party contact profile failed: %s", exc)
 
     # ---- 自动 Facts 提取 ----
     # 从本轮对话中通过轻量 LLM 提取结构化事实，写入 L3 Facts 集合

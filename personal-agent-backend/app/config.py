@@ -184,6 +184,8 @@ class Settings(BaseSettings):
     # 默认对话对象（开机/新会话默认女友模式）
     default_owner_person_id: str = ""
     default_owner_display_name: str = "刘远慧"
+    # 第三方人物：随口提及至少 N 次后才 confirmed（高置信关系/事实仍立即确认）
+    contact_min_casual_mentions: int = 2
 
     # ============================
     # 记忆关联图参数
@@ -227,9 +229,10 @@ class Settings(BaseSettings):
     follow_up_probability: float = 0.6
 
     # ============================
+    # ============================
     # TTS 语音合成配置（百度）
     # ============================
-    # 百度 TTS API Key（用于 text2audio 接口）
+    # 百度 TTS API Key（用于旧版 text2audio 接口）
     # 不配置时 TTS 功能关闭，只返回文本 bubbles
     tts_api_key: str = ""
     # 发音人 ID（4100=度小乔，4103=度小贤，4117=度小鹿 等）
@@ -242,6 +245,14 @@ class Settings(BaseSettings):
     tts_volume: int = 8
     # 音频格式：pcm = raw PCM (aue=4), wav = WAV (aue=6)
     tts_audio_format: str = "pcm"
+
+    # ============================
+    # 声音复刻配置（百度大模型声音复刻）
+    # ============================
+    # 百度云 API Key，在 https://console.bce.baidu.com/iam/#/iam/apikey/list 创建
+    baidu_api_key: str = ""
+    # 复刻音色 ID，运行 scripts/create_voice.py 上传音频后获得
+    tts_clone_voice_id: str = ""
 
     # ============================
     # 运行时参数

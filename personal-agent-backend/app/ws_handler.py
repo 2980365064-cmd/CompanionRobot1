@@ -92,6 +92,8 @@ def _get_tts_config() -> TTSConfig:
             pitch=settings.tts_pitch,
             volume=settings.tts_volume,
             audio_format=settings.tts_audio_format,
+            baidu_api_key=settings.baidu_api_key,
+            clone_voice_id=settings.tts_clone_voice_id,
         )
     return _tts_config
 
@@ -141,11 +143,12 @@ async def _stream_tts_chunks(
 ) -> None:
     """Fetch PCM from Baidu TTS and send as binary WebSocket frames."""
     pcm = await tts_fetch_pcm(text, config)
-    # Send in ~50ms chunks (1600 bytes = 16000*2*50/1000)
-    chunk_size = 1600
+    # Send in ~100ms chunks (3200 bytes = 16000*2*0.1)
+    # Larger chunks = fewer WebSocket sends and sleep calls = less overhead
+    chunk_size = 3200
     for offset in range(0, len(pcm), chunk_size):
         await websocket.send_bytes(pcm[offset:offset + chunk_size])
-        await asyncio.sleep(0.048)  # pace to real-time so ESP32 queue doesn't overflow
+        await asyncio.sleep(0.095)  # pace to real-time so ESP32 queue doesn't overflow
 
 
 async def _send_bubble_tts(

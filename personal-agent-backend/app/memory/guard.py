@@ -90,13 +90,13 @@ _RECALL_PRESS = [
 
 # 个人信息类关键词 —— 涉及用户的身份、关系、经历
 # 匹配到 → 需要记忆检索参与回答
+# 注意：不再硬编码地名/场所（如杭州/南溪/爱琴海），这些由 L3 语义检索自然覆盖
 _PERSONAL = [
     r"女朋友|男友|老婆|老公|远慧|刘远慧|刘大炮|秋雨|刘远航",
-    r"你谁|我是谁|你是谁|叫什么|输错|打错|姐姐|弟弟|亲戚",
+    r"你谁|我是谁|你是谁|叫什么名字|输错|打错",
     r"我俩|咱们|我们一起|咱俩",
-    r"见面|约会|去哪|吃过|玩过",
-    r"实习|杭州|南溪|爱琴海",
-    r"喜欢什么|爱吃|忌口|喝什么",
+    r"去过哪|一起吃过|一起玩过|上次见面|上次约会",
+    r"爱吃什么|忌口什么|不喜欢吃|对什么过敏",
     r"周末.*(干嘛|做什么|干啥)",
 ]
 
@@ -225,6 +225,13 @@ def memory_l3_hit(memory: dict | None) -> bool:
     return bool(mem.get("l3_hit") or mem.get("facts_hit"))
 
 
+# 问机器人自身 —— 应从 persona 回答，不需要查用户记忆
+_SELF_REFERENTIAL = re.compile(
+    r"你是谁|你是谁呀|你叫(什么|啥)|你的名字|你是什么|你是啥|你是机器人|你是人|"
+    r"你的名字是|你(在|正在|刚才|刚刚)(干|做|忙)啥|你(在|正在)干嘛|你在做什么|"
+    r"你干什么呢|你(是)?怎么(工作|运作|回答|回复)的|你有(什么|哪些)(功能|能力)"
+)
+
 def query_needs_memory_answer(query: str) -> bool:
     """综合判断本轮是否需要记忆支撑回答。
 
@@ -232,14 +239,15 @@ def query_needs_memory_answer(query: str) -> bool:
 
     决策逻辑（按优先级）：
       1. 空消息 → 不需要
-      2. 寒暄短句 → 不需要（跳过 embedding 调用）
-      3. 身份类问题 → 需要
-      4. 含回忆信号词 → 需要
-      5. 询问认识某人 → 需要
-      6. 含个人信息关键词 → 需要
-      7. 短事实类查询 → 需要
-      8. 短问句 → 需要
-      9. 含疑问词 + 短消息 → 需要
+      2. 问机器人自身（你是谁/你叫什么/你在干嘛）→ 不需要（从 persona 回答）
+      3. 寒暄短句 → 不需要（跳过 embedding 调用）
+      4. 身份类问题 → 需要
+      5. 含回忆信号词 → 需要
+      6. 询问认识某人 → 需要
+      7. 含个人信息关键词 → 需要
+      8. 短事实类查询 → 需要
+      9. 短问句 → 需要
+      10. 含疑问词 + 短消息 → 需要
 
     Args:
         query: 用户消息文本
@@ -249,6 +257,8 @@ def query_needs_memory_answer(query: str) -> bool:
     """
     q = query.strip()
     if not q:
+        return False
+    if _SELF_REFERENTIAL.search(q):
         return False
     if is_casual_smalltalk(q):
         return False
@@ -263,9 +273,12 @@ def query_needs_memory_answer(query: str) -> bool:
             return True
     if _FACT_QUERY.search(q) and len(q) <= 48:
         return True
-    if _QUESTION_MARK.search(q) and len(q) <= 40:
+    # Short question + question mark → might need memory (e.g. "她叫什么来着")
+    # But keep max length tight to avoid triggering on casual "干嘛呢？"
+    if _QUESTION_MARK.search(q) and len(q) <= 25:
         return True
-    if re.search(r"(什么|谁|哪|几|咋|怎么|为啥|为什么)", q) and len(q) <= 60:
+    # Contains question word + short → more likely a real question needing memory
+    if re.search(r"(什么|谁|哪|为啥|为什么)", q) and len(q) <= 35:
         return True
     return False
 
@@ -375,6 +388,23 @@ def memory_evidence_supports_query(user_msg: str, memory: dict) -> bool:
     return False
 
 
+def memory_miss_level(memory: dict) -> int:
+    """记忆未命中的程度：0=命中, 1=弱命中（有相关内容但不直接）, 2=完全未命中。
+
+    替代旧的 memory_miss bool 二分法。agent 根据级别注入不同强度的提示，
+    而非一刀切跳过 LLM。
+    """
+    if not memory.get("memory_miss"):
+        return 0
+    has_any = bool(
+        (memory.get("matches") or {}).get("l2")
+        or (memory.get("matches") or {}).get("l3")
+        or memory.get("episodic")
+        or memory.get("l3")
+    )
+    return 1 if has_any else 2
+
+
 def memory_requires_unknown_reply(user_msg: str, memory: dict) -> bool:
     """是否应直接回复「不知道/请补充」，禁止走创意生成。"""
     if memory.get("guest_mode"):
@@ -459,18 +489,14 @@ _KNOWN_PERSON_MARKERS = re.compile(
 
 # ── 反幻觉铁律（注入 system prompt 的最高优先级规则）────────────────────
 
-ANTI_HALLUCINATION_RULES = """## 事实铁律（最高优先级，覆盖口吻与调侃）
+ANTI_HALLUCINATION_RULES = """## 事实原则（记住：你是叶鹏祥，不是记忆查询工具）
 
-**只允许**使用以下来源中的具体事实：L0 核心记忆（身份/喜恶/禁忌/纪念日，日常优先）、L2 近期摘要、L3 长期记忆、已入库事实；人物履历归档仅在深度谈心时启用。
-- **角色铁律**：消息中 [对方] 开头的是用户说的，[你] 开头的是你（叶鹏祥）说过的话。**绝对禁止**把 [你] 开头的消息当成用户消息来回复——那是你自己说的话，不是用户说的。只回应最新一条 [对方] 消息。
-- L0 禁忌类条目：**生成回复前必须先检查**，任何情况下不得触碰。
-- **禁止**把用户**本条刚说的**内容当成「早就知道」：仅本轮首次出现的自称/经历/关系，不能回复成老熟人（禁止：认识你、好久不见、我记得你、你终于来了、咱上次…）。
-- 记忆库**没有**的人名、关系、经历、地点、约定、喜好 → 必须口语表示**不清楚或没印象**，并可口语追问一句补记忆；**禁止编造**。
-- 用户问具体事件/日期/人物而 L2/L3 **未给出可直接回答的条目** → 只能说不记得/没查到/你跟我讲讲，**禁止**用 persona 口吻「圆故事」或凭常识瞎编。
-- **禁止**根据姓氏相近、谐音、名字像就推断关系（例：刘远航≠刘远慧的姐姐）。
-- 用户纠正打错字/改名：只认**最新说法**；勿补全记忆未写明的「你姐」「你们家」等。
-- L3 语料里出现的人名**不等于**当前发消息的人就是那人，除非记忆明确对应。
-- 不确定时宁可短句追问，也不要「帮你圆故事」。"""
+- 说话时记忆是辅助参考，不是脚本。先做人，再做记忆检索
+- 记忆里没有的，用你自己的口吻诚实说，可以追问但不要编造。别用"记忆库里没有"这种机器人话——你是人，说"我不太记得了""你提醒我一下"就好
+- 不要把对方本条刚说的当成早就知道的事。不认识就是不认识，别装熟人
+- 禁止根据名字相近就推断关系（如刘远航≠刘远慧的姐姐）
+- L0 禁忌类条目生成回复前必须检查，任何情况下不得触碰
+- 消息中 [对方] 开头的是用户说的，[你] 开头的是你自己说过的话——别把自己的话当成用户的话来回复"""
 
 
 def is_valid_person_name(name: str) -> bool:
@@ -861,8 +887,8 @@ def user_message_hints(
 
     if mem.get("memory_miss") and query_needs_memory_answer(msg):
         lines.append(
-            "【本条 · 硬性约束】记忆库未检索到与用户问题相关的内容："
-            "只能说不记得/没印象并请对方补充，禁止编造任何细节。"
+            "【本条】记忆检索没找到直接相关的内容："
+            "诚实说不太记得就好，用你的口吻——可以追问但别编。"
         )
 
     return "\n".join(lines)
