@@ -27,5 +27,9 @@ esp_sparkbot/example/factory_demo_v1/build/
 esp_sparkbot/example/factory_demo_v1/sdkconfig
 esp_sparkbot/example/factory_demo_v1/sdkconfig.old
 
+# Claude Code (local only)
+.claude/settings.local.json
+CLAUDE.local.md
+
 # IDE
 .idea/
