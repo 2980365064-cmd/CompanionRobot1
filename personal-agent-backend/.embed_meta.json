@@ -1,0 +1,5 @@
+{
+  "dim": 1024,
+  "provider": "aliyun_dashscope",
+  "model": "text-embedding-v3"
+}

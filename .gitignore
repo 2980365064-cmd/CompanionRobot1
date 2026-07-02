@@ -33,3 +33,22 @@ CLAUDE.local.md
 
 # IDE
 .idea/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# Python缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+logs/
+
+# IDE配置
+.idea/
+.vscode/
+.DS_Store
+*.swp

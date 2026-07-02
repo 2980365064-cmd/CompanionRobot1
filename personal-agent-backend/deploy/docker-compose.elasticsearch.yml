@@ -1,0 +1,25 @@
+# ES only — backend runs separately (venv / systemd).
+# Usage on server:
+#   cd /opt/sparkbot/personal-agent-backend/deploy
+#   docker-compose -f docker-compose.elasticsearch.yml up -d
+#
+# Requires ~512MB heap; 2GB ECS is tight — add swap if OOM.
+
+version: "3.8"
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.14.0
+    container_name: sparkbot-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "127.0.0.1:9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    restart: unless-stopped
+    mem_limit: 768m
+
+volumes:
+  es_data:
