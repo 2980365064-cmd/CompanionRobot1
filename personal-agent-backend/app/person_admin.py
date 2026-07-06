@@ -71,10 +71,9 @@ def update_person_admin(
     级联影响：
       修改 person_id 会通过 store.rename_person_id 在同一事务中更新以下所有表：
         - person_profiles（画像）
-        - episodic_memories（L2 情景记忆）
-        - semantic_facts（语义事实）
-        - l3_chunks（L3 向量块）
-        - l0_core_memories（L0 核心记忆）
+        - episodic_memories（情景记忆）
+        - l3_chunks（长期记忆块）
+        - l0_core_memories（核心记忆）
         - l3_recall_stats（L3 召回统计）
         - sessions（活跃会话绑定的 person_id）
       这样可以保证 person_id 改名后所有历史记忆不丢失。

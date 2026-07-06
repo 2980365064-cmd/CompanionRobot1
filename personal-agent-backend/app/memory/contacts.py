@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.config import settings
+from app.memory.person_resolver import PersonResolution, resolve_person
 from app.memory.guard import (
     extract_asked_person_name,
     extract_self_name,
@@ -268,18 +269,44 @@ def upsert_contact_from_signal(
     device_id: str,
     owner_person_id: str,
     sig: ContactSignal,
+    *,
+    resolution: PersonResolution | None = None,
 ) -> tuple[dict | None, str]:
-    """根据信号创建或更新第三方画像。返回 (profile, event_msg)。"""
+    """根据信号创建或更新第三方画像。返回 (profile, event_msg)。
+
+    如果提供了 resolution，会根据 resolution.source 做差异处理：
+      - "contact" → 仅更新提及次数（正常走 existing 路径）
+      - "wiki"    → 从 wiki 元数据创建 confirmed contact，不新建空档案
+      - "l3"      → 跳过，不创建画像，返回 ("skip")
+      - "unknown" → 正常按置信度创建
+    """
     from datetime import datetime, timezone
 
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
 
+    # ── L3 已知但不结构化 → 跳过 ──
+    if resolution and resolution.source == "l3":
+        return None, ""
+
     existing = find_contact_profile(device_id, owner_person_id, sig.name)
     mention_count = int((existing or {}).get("mention_count") or 0) + 1
     threshold = max(1, int(getattr(settings, "contact_min_casual_mentions", 2)))
 
-    if existing:
+    # ── Wiki 已知 → 从 wiki 元数据创建/补全为 confirmed contact ──
+    if resolution and resolution.source == "wiki" and not existing:
+        profile = _empty_contact(device_id, owner_person_id, sig.name,
+                                 relationship=resolution.wiki_meta.get("relationship", "") if resolution.wiki_meta else "")
+        profile["source"] = "wiki"
+        profile["source_path"] = resolution.wiki_source_path
+        profile["wiki_synced_at"] = _now()
+        profile["confirmed"] = True
+        if resolution.wiki_meta and resolution.wiki_meta.get("aliases"):
+            profile["aliases"] = list(resolution.wiki_meta["aliases"])
+        if resolution.wiki_body_facts:
+            profile["notes"] = list(resolution.wiki_body_facts)
+        existing = None  # 不进入 "更新" 分支
+    elif existing:
         profile = normalize_profile(existing)
     elif sig.confidence == "high":
         profile = _empty_contact(device_id, owner_person_id, sig.name, relationship=sig.relationship)
@@ -309,8 +336,22 @@ def upsert_contact_from_signal(
 
     profile["updated_at"] = _now()
     store.save_person_profile(device_id, profile)
+
     action = "更新" if existing else "新建"
     nick = profile_display_name(profile)
+
+    # ── 生成差异化 monitor 文案 ──
+    if resolution:
+        if resolution.source == "wiki":
+            if existing:
+                logger.info("contact wiki-sync update: %s owner=%s", nick, owner_person_id[:8])
+                return profile, f"Wiki人物同步(更新) · {nick}"
+            logger.info("contact wiki-sync new: %s owner=%s", nick, owner_person_id[:8])
+            return profile, f"Wiki人物同步 · {nick}"
+        if resolution.source == "contact":
+            logger.info("contact mention: %s owner=%s", nick, owner_person_id[:8])
+            return profile, f"第三方画像命中 · {nick}"
+
     if not profile.get("confirmed") and sig.confidence == "low":
         return profile, f"第三方提及 · {nick}（{mention_count}/{threshold}）"
     logger.info("contact %s: %s owner=%s", action, nick, owner_person_id[:8])
@@ -372,7 +413,15 @@ def process_third_party_from_turn(
     *,
     owner_profile: dict | None = None,
 ) -> list[str]:
-    """处理一轮对话中的第三方人物信号，返回 monitor 事件文案列表。"""
+    """处理一轮对话中的第三方人物信号，返回 monitor 事件文案列表。
+
+    增强点（集成 person_resolver）：
+      - 先通过 resolve_person 判断每个人名的认知来源
+      - contact 已知 → 仅命中，不新建
+      - Wiki 已知 → 自动同步为 contact，标注"Wiki人物同步"
+      - L3 已知但不结构化 → 跳过，不创建画像
+      - 未知 → 按正常置信度策略创建
+    """
     pid = str(owner_person_id or "").strip()
     if not pid or pid.startswith("tmp_"):
         return []
@@ -387,12 +436,32 @@ def process_third_party_from_turn(
     signals = _detect_signals(user_msg, exclude_names=exclude)
     touched: dict[str, dict] = {}
 
+    # ── 先统一解析每个人名的认知来源 ──
+    resolutions: dict[str, PersonResolution] = {}
     for sig in signals:
-        prof, ev = upsert_contact_from_signal(device_id, pid, sig)
+        key = _normalize_name(sig.name)
+        if key in resolutions:
+            continue
+        if should_skip_contact_name(sig.name, exclude=exclude):
+            continue
+        resolutions[key] = resolve_person(sig.name, device_id, pid)
+
+    for sig in signals:
+        key = _normalize_name(sig.name)
+        resolution = resolutions.get(key)
+
+        # L3 已知但不结构化 → 跳过，不创建 contact
+        if resolution and resolution.source == "l3":
+            continue
+
+        prof, ev = upsert_contact_from_signal(
+            device_id, pid, sig,
+            resolution=resolution,
+        )
         if ev:
             events.append(ev)
         if prof:
-            touched[_normalize_name(sig.name)] = prof
+            touched[key] = prof
 
     # 对已确认联系人，用 LLM 从本轮用户话里增量补充（仅 high/medium 信号或已确认）
     for sig in signals:
@@ -448,14 +517,29 @@ def format_contacts_prompt_block(
     if not pid or pid.startswith("tmp_"):
         return ""
     contacts = list_contacts_for_owner(device_id, pid)
-    if not contacts:
-        return ""
     exclude = _owner_names(owner_profile, pid)
     relevant = contacts_mentioned_in_message(user_message, contacts, exclude_names=exclude)
     if not relevant:
         confirmed = [p for p in contacts if p.get("confirmed")]
         relevant = confirmed[:2]
-    if not relevant:
+
+    # 额外检查：对话中提到的 Wiki 已知人物（无 contact 时也能注入）
+    wiki_fallback: list[PersonResolution] = []
+    asked = extract_asked_person_name(user_message or "")
+    if asked or not relevant:
+        # 先获取已有 contact 的所有称呼，避免重复注入
+        mentioned_contact_names = set()
+        for p in confirmed_contacts_for_owner(device_id, pid):
+            for n in profile_nicknames(p):
+                mentioned_contact_names.add(_normalize_name(n))
+
+        # 如果用户在问某个人，且此人 Wiki 已知但不在 contact 中
+        if asked:
+            res = resolve_person(asked, device_id, pid)
+            if res.source == "wiki" and _normalize_name(asked) not in mentioned_contact_names:
+                wiki_fallback.append(res)
+
+    if not relevant and not wiki_fallback:
         return ""
 
     lines = [
@@ -474,5 +558,29 @@ def format_contacts_prompt_block(
         if p.get("experiences"):
             parts.append("经历：" + "；".join(str(x) for x in p["experiences"][:3]))
         lines.append("- " + " | ".join(parts))
+    # Wiki 已知但无 contact 的人物
+    for res in wiki_fallback[:2]:
+        wiki = res.wiki_meta or {}
+        rel = wiki.get("relationship", "")
+        rel_line = f"与对话对象关系：{rel}" if rel else "关系：未明"
+        name = res.display_name
+        parts = [f"【{name}】{rel_line}（Wiki 记录）"]
+        if res.wiki_body_facts:
+            parts.append("备注：" + "；".join(res.wiki_body_facts[:4]))
+        lines.append("- " + " | ".join(parts))
     lines.append("- 档案未写明的细节 → 说不记得或请对方补充，禁止编造")
     return "\n".join(lines) + "\n"
+
+
+def confirmed_contacts_for_owner(device_id: str, owner_person_id: str) -> list[dict]:
+    """获取当前 owner 下所有已确认的第三方联系人。"""
+    out: list[dict] = []
+    for row in store.list_person_profiles(device_id):
+        p = normalize_profile(row["profile"])
+        if not _is_contact_profile(p):
+            continue
+        if str(p.get("owner_person_id") or "") != str(owner_person_id):
+            continue
+        if p.get("confirmed"):
+            out.append(p)
+    return out

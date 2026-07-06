@@ -51,18 +51,20 @@ def _format_transcript(messages: list[dict]) -> str:
     return "\n".join(f"{m['role']}: {m['content']}" for m in messages)
 
 
-# LLM 摘要指令：要求 LLM 生成 4 维度的 L2 摘要
-# 包含 summary（150~280 字叙述）、topics（逗号分隔主题）、
-# open_loops（未完结事项数组）、emotion（情感快照 JSON）
-_L2_SUMMARY_INSTRUCTION = """将以下对话压缩为 **L2 短期记忆**（近 7 天可查，比 L3 更细）。
+# LLM 摘要指令：要求 LLM 生成 6 维度的 L2 摘要
+# 新增 importance 和 people 字段以支持情感重要性加权
+_L2_SUMMARY_INSTRUCTION = """将以下对话压缩为 **L2 情景记忆**（用于长期情感感知）。
 
 要求：
 - summary：150～280 字，写清时间线、谁说了什么、情绪、决定、待办、对方自称/关系（若有）
 - topics：逗号分隔主题
 - open_loops：未完结事项数组，无则 []
-- emotion：从以下值选取 — mood 取 平静/开心/低落/焦虑/难过/生气/兴奋/疲惫/烦躁/害怕/轻松/期待；intensity 取 0.0~1.0（强度）；trigger 为情绪诱因（无则空字符串）；attitude 为用户对助手的互动态度 倾诉/依赖/敷衍/调侃/冷淡/亲密/求助（无则空字符串）
+- emotion：mood 取 平静/开心/低落/焦虑/难过/生气/兴奋/疲惫/烦躁/害怕/轻松/期待；intensity 取 0.0~1.0；trigger 为情绪诱因；attitude 为 倾诉/依赖/敷衍/调侃/冷淡/亲密/求助
+- importance：1~5（1-闲聊/琐事, 2-日常, 3-普通, 4-重要事件/情绪事件, 5-里程碑/重大决定）
+- people：涉及的人物名数组（无则 []）
 
-只输出 JSON：{{"summary":"...","topics":"...","open_loops":[],"emotion":{{"mood":"平静","intensity":0.3,"trigger":"","attitude":""}}}}"""
+只输出 JSON：
+{{"summary":"...","topics":"...","open_loops":[],"emotion":{{"mood":"平静","intensity":0.3,"trigger":"","attitude":""}},"importance":3,"people":[]}}"""
 
 
 def compress_l1_to_l2(device_id: str, session_id: str) -> bool:
@@ -122,11 +124,17 @@ def compress_l1_to_l2(device_id: str, session_id: str) -> bool:
     loops = data.get("open_loops", [])
     open_loops = json.dumps(loops, ensure_ascii=False) if loops else ""
     emotion = json.dumps(data.get("emotion") or {}, ensure_ascii=False)
+    importance = int(data.get("importance") or 3)
+    importance = max(1, min(5, importance))
+    # people 字段：JSON 数组字符串
+    raw_people = data.get("people", [])
+    people = json.dumps(raw_people, ensure_ascii=False) if isinstance(raw_people, list) and raw_people else ""
 
-    # 写入 L2 情景记忆（附带 emotion JSON 字段，供情感轨迹查询）
+    # 写入 L2 情景记忆（附带情感、重要性、涉及人物等结构化元数据）
     person_id = store.get_session_active_person_id(session_id) or ""
     episodic_memory.save_summary(
-        device_id, person_id, session_id, summary, topics, open_loops, emotion=emotion
+        device_id, person_id, session_id, summary, topics, open_loops,
+        emotion=emotion, importance=importance, people=people,
     )
     # 删除已压缩的原始 L1 消息（释放 messages 表存储空间）
     # 压缩是"移出"操作：L1 → L2，原消息不再需要

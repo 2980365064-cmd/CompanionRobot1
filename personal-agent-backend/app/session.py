@@ -9,9 +9,8 @@
 
   sessions              会话表（device_id + session_id + active_person_id）
   messages              消息表（L1 工作记忆：role + content）
-  episodic_memories     情景记忆表（L2：会话摘要 + 话题 + 未决事项 + 情绪）
-  semantic_facts        语义事实表（L3 Facts：提取的结构化事实）
-  l3_chunks             L3 向量块表（聊天记忆 + 语料知识）
+  episodic_memories     情景记忆表（会话摘要 + 话题 + 未决事项 + 情绪）
+  l3_chunks             向量块表（长期记忆 + 语料知识）
   l3_chunks_fts         L3 全文索引（FTS5 虚拟表）
   l0_core_memories      L0 核心记忆表（高置信核心事实）
   l3_recall_stats       L3 召回统计表（追踪高频召回用于 L0 升级）
@@ -33,6 +32,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -42,6 +42,8 @@ from typing import Iterator
 from uuid import uuid4
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 # ============================
@@ -67,6 +69,22 @@ def _expires_at(days: int | None = None) -> str:
     """
     d = days if days is not None else settings.l2_retention_days
     return (datetime.now(timezone.utc) + timedelta(days=d)).isoformat()
+
+
+def _decode_text_cell(value: object, *, column: str, rowid: int | None = None) -> str | None:
+    """把 SQLite 文本列安全转为 str，遇到损坏 UTF-8 时返回 None。"""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            where = f" rowid={rowid}" if rowid is not None else ""
+            logger.warning("跳过损坏的 SQLite 文本列%s column=%s hex=%s", where, column, value.hex())
+            return None
+    return str(value)
 
 
 # ============================
@@ -132,6 +150,45 @@ class SessionStore:
     # Schema 迁移
     # ============================
 
+    def _migrate_relationship_state(self, conn: sqlite3.Connection) -> None:
+        """创建关系状态存储表（relationship_states）。"""
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS relationship_states (
+                person_id TEXT PRIMARY KEY,
+                state_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+    def _migrate_open_loops(self, conn: sqlite3.Connection) -> None:
+        """创建结构化待跟进事项表（open_loops）。"""
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS open_loops (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                due_hint TEXT DEFAULT '',
+                emotional_weight INTEGER NOT NULL DEFAULT 3,
+                created_at TEXT NOT NULL,
+                last_mentioned_at TEXT DEFAULT '',
+                cooldown_until TEXT DEFAULT '',
+                source_session_id TEXT DEFAULT '',
+                resolved_evidence TEXT DEFAULT ''
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_open_loops_person ON open_loops(person_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_open_loops_status ON open_loops(person_id, status)"
+        )
+
     def _migrate_episodic(self, conn: sqlite3.Connection) -> None:
         """迁移 episodic_memories 表，添加新字段。
 
@@ -151,6 +208,12 @@ class SessionStore:
             conn.execute("ALTER TABLE episodic_memories ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
         if "emotion" not in cols:
             conn.execute("ALTER TABLE episodic_memories ADD COLUMN emotion TEXT")
+        if "importance" not in cols:
+            conn.execute("ALTER TABLE episodic_memories ADD COLUMN importance INTEGER NOT NULL DEFAULT 3")
+        if "people" not in cols:
+            conn.execute("ALTER TABLE episodic_memories ADD COLUMN people TEXT DEFAULT '[]'")
+        if "status" not in cols:
+            conn.execute("ALTER TABLE episodic_memories ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
         # 补充现有的空 expires_at
         conn.execute(
             "UPDATE episodic_memories SET expires_at=? WHERE expires_at IS NULL OR expires_at=''",
@@ -181,9 +244,6 @@ class SessionStore:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_episodic_person_expires "
             "ON episodic_memories(person_id, expires_at)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_facts_person ON semantic_facts(person_id)"
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_l3_person ON l3_chunks(collection, device_id, person_id)"
@@ -258,11 +318,6 @@ class SessionStore:
         if epi_cols and "person_id" not in epi_cols:
             conn.execute(
                 "ALTER TABLE episodic_memories ADD COLUMN person_id TEXT NOT NULL DEFAULT ''"
-            )
-        fact_cols = {row[1] for row in conn.execute("PRAGMA table_info(semantic_facts)")}
-        if fact_cols and "person_id" not in fact_cols:
-            conn.execute(
-                "ALTER TABLE semantic_facts ADD COLUMN person_id TEXT NOT NULL DEFAULT ''"
             )
         l3_cols = {row[1] for row in conn.execute("PRAGMA table_info(l3_chunks)")}
         if l3_cols and "person_id" not in l3_cols:
@@ -361,16 +416,6 @@ class SessionStore:
                     expires_at TEXT,
                     archived INTEGER NOT NULL DEFAULT 0
                 );
-                -- L3 Facts 表：从对话中提取的结构化事实
-                CREATE TABLE IF NOT EXISTS semantic_facts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    device_id TEXT NOT NULL,
-                    fact TEXT NOT NULL,
-                    category TEXT DEFAULT 'general',
-                    confidence REAL DEFAULT 0.8,
-                    source_session TEXT,
-                    created_at TEXT NOT NULL
-                );
                 -- 人物画像表：JSON 格式存储完整 Profile Card
                 CREATE TABLE IF NOT EXISTS person_profiles (
                     person_id TEXT PRIMARY KEY,
@@ -407,6 +452,8 @@ class SessionStore:
             self._migrate_sessions(conn)
             self._migrate_person_scope(conn)
             self._migrate_memory_relations(conn)
+            self._migrate_relationship_state(conn)
+            self._migrate_open_loops(conn)
             self._ensure_indexes(conn)
 
     # ============================
@@ -634,6 +681,9 @@ class SessionStore:
         *,
         person_id: str = "",
         emotion: str = "",
+        importance: int = 3,
+        people: str = "[]",
+        status: str = "active",
     ) -> None:
         """添加一条 L2 情景记忆记录。
 
@@ -645,21 +695,28 @@ class SessionStore:
             open_loops: 未决事项（需要后续跟进的话题）
             person_id:  用户 ID（用于多用户隔离）
             emotion:    情绪标签（如"开心"/"生气"/"焦虑"）
+            importance: 重要性 1-5（3=普通，4=重要事件，5=里程碑）
+            people:     涉及人物的 JSON 数组字符串
+            status:     状态：active/archived/corrected
 
-        自动设置 7 天过期时间（expires_at）。
+        自动设置 14 天过期时间（expires_at），比旧版 7 天长，
+        以支持更久的情感近况感知。
         """
         now = _utc_now()
         exp = _expires_at()
         pid = str(person_id or "").strip()
+        imp = max(1, min(5, int(importance))) if importance else 3
         with self._conn() as conn:
             conn.execute(
                 """
                 INSERT INTO episodic_memories(
                     device_id, person_id, session_id, summary, topics, open_loops,
-                    created_at, expires_at, archived, emotion
-                ) VALUES (?,?,?,?,?,?,?,?,0,?)
+                    created_at, expires_at, archived, emotion,
+                    importance, people, status
+                ) VALUES (?,?,?,?,?,?,?,?,0,?, ?,?,?)
                 """,
-                (device_id, pid, session_id, summary, topics, open_loops, now, exp, emotion),
+                (device_id, pid, session_id, summary, topics, open_loops,
+                 now, exp, emotion, imp, people, status),
             )
 
     def list_episodic_active(
@@ -668,6 +725,7 @@ class SessionStore:
         """获取用户的活跃 L2 情景记忆行（未归档且未过期）。
 
         返回按 ID 倒序（最新的在前），用于 prompt 中的 L2 注入。
+        包含重要性评分（importance）和涉及人物（people）等新字段。
         """
         del device_id
         now = _utc_now()
@@ -675,12 +733,42 @@ class SessionStore:
         with self._conn() as conn:
             rows = conn.execute(
                 """
-                SELECT id, summary, topics, open_loops, emotion, created_at, expires_at
+                SELECT id, summary, topics, open_loops, emotion,
+                       created_at, expires_at, importance, people, status
                 FROM episodic_memories
                 WHERE person_id=? AND archived=0 AND expires_at > ?
                 ORDER BY id DESC LIMIT ?
                 """,
                 (pid, now, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_important_episodes(
+        self, person_id: str, min_importance: int = 4, limit: int = 10,
+    ) -> list[dict]:
+        """获取用户的重要情景记忆（高重要性事件，不受过期限制）。
+
+        参数:
+            person_id:       用户 ID
+            min_importance:  最低重要性（4=重要事件，5=里程碑）
+            limit:           最多条数
+
+        返回:
+            按重要性降序、时间倒序排列的事件列表。
+        """
+        pid = str(person_id or "").strip()
+        if not pid:
+            return []
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, summary, topics, open_loops, emotion,
+                       created_at, expires_at, importance, people, status
+                FROM episodic_memories
+                WHERE person_id=? AND importance>=? AND archived=0
+                ORDER BY importance DESC, id DESC LIMIT ?
+                """,
+                (pid, min_importance, limit),
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -743,134 +831,20 @@ class SessionStore:
         confidence: float,
         source_session: str,
     ) -> int | None:
-        """添加一条语义事实记录（L3 Facts）。
-
-        参数:
-            device_id:      设备标识
-            person_id:      用户 ID
-            fact:           事实文本（如"张三住在北京"）
-            category:       分类（如"identity"/"preference"/"experience"）
-            confidence:     置信度 0.0-1.0
-            source_session: 来源会话 ID（用于追溯）
-
-        返回:
-            新记录的 ID，失败返回 None
-        """
-        pid = str(person_id or "").strip()
-        with self._conn() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO semantic_facts(
-                    device_id, person_id, fact, category, confidence, source_session, created_at
-                ) VALUES (?,?,?,?,?,?,?)
-                """,
-                (device_id, pid, fact, category, confidence, source_session, _utc_now()),
-            )
-            return int(cur.lastrowid) if cur.lastrowid else None
+        """添加一条事实记录（已废弃，当前版本保留为 no-op 以兼容旧调用）。"""
+        return None
 
     def get_fact_by_id(self, fact_id: int) -> dict | None:
-        """根据 ID 获取单条事实记录。"""
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT id, fact, category, confidence, person_id FROM semantic_facts WHERE id=?",
-                (int(fact_id),),
-            ).fetchone()
-        return dict(row) if row else None
+        """根据 ID 获取单条事实记录（已废弃，当前版本始终返回 None）。"""
+        return None
 
     def get_fact_by_text(self, person_id: str, fact_text: str) -> dict | None:
-        """根据用户 ID 和事实文本精确查找（用于去重检查）。"""
-        pid = str(person_id or "").strip()
-        text = str(fact_text or "").strip()
-        if not pid or not text:
-            return None
-        with self._conn() as conn:
-            row = conn.execute(
-                """
-                SELECT id, fact, category, confidence FROM semantic_facts
-                WHERE person_id=? AND fact=? ORDER BY id DESC LIMIT 1
-                """,
-                (pid, text),
-            ).fetchone()
-        return dict(row) if row else None
+        """（已废弃）旧 Facts 表已移除，始终返回 None。"""
+        return None
 
     def list_facts(self, device_id: str, person_id: str, limit: int = 50) -> list[dict]:
-        """获取用户的语义事实列表（跨设备共享，不含 id 字段）。"""
-        del device_id
-        pid = str(person_id or "").strip()
-        with self._conn() as conn:
-            rows = conn.execute(
-                """
-                SELECT fact, category, confidence FROM semantic_facts
-                WHERE person_id=? ORDER BY id DESC LIMIT ?
-                """,
-                (pid, limit),
-            ).fetchall()
-        return [dict(r) for r in rows]
-
-    def list_facts_detailed(self, device_id: str, person_id: str, limit: int = 30) -> list[dict]:
-        """获取用户的详细语义事实列表（含 id 字段，用于修正/删除操作）。"""
-        del device_id
-        pid = str(person_id or "").strip()
-        with self._conn() as conn:
-            rows = conn.execute(
-                """
-                SELECT id, fact, category, confidence FROM semantic_facts
-                WHERE person_id=? ORDER BY id DESC LIMIT ?
-                """,
-                (pid, limit),
-            ).fetchall()
-        return [dict(r) for r in rows]
-
-    def search_facts_containing(self, substring: str, limit: int = 20) -> list[dict]:
-        """全局事实搜索（子字符串匹配 LIKE）。
-
-        用于身份识别前探测：用户说"我是张三"时，先全局搜索"张三"
-        是否已出现在任何人的 Facts 中，帮助判断是新增还是已有用户。
-        """
-        sub = substring.strip()
-        if len(sub) < 2:
-            return []
-        with self._conn() as conn:
-            rows = conn.execute(
-                """
-                SELECT person_id, fact, category, confidence FROM semantic_facts
-                WHERE fact LIKE ? ORDER BY id DESC LIMIT ?
-                """,
-                (f"%{sub}%", limit),
-            ).fetchall()
-        return [dict(r) for r in rows]
-
-    def delete_facts_by_ids(self, fact_ids: list[int]) -> int:
-        """根据 ID 列表批量删除事实记录，返回删除数量。"""
-        if not fact_ids:
-            return 0
-        placeholders = ",".join("?" * len(fact_ids))
-        with self._conn() as conn:
-            cur = conn.execute(
-                f"DELETE FROM semantic_facts WHERE id IN ({placeholders})",
-                fact_ids,
-            )
-            return cur.rowcount
-
-    def delete_facts_matching(
-        self, device_id: str, substring: str, *, person_id: str | None = None
-    ) -> int:
-        """删除内容匹配子字符串的事实记录（要求子串 >= 4 字符防止误删）。"""
-        sub = substring.strip()
-        if not sub or len(sub) < 4:
-            return 0
-        with self._conn() as conn:
-            if person_id is not None:
-                cur = conn.execute(
-                    "DELETE FROM semantic_facts WHERE person_id=? AND fact LIKE ?",
-                    (str(person_id).strip(), f"%{sub}%"),
-                )
-            else:
-                cur = conn.execute(
-                    "DELETE FROM semantic_facts WHERE device_id=? AND fact LIKE ?",
-                    (device_id, f"%{sub}%"),
-                )
-            return cur.rowcount
+        """（已废弃）旧 Facts 表已移除，始终返回空列表。"""
+        return []
 
     # ============================
     # 记忆关联图（Memory Relations）
@@ -994,38 +968,29 @@ class SessionStore:
         *,
         chunk_key_prefix: str = "chunk:doc-",
     ) -> dict[str, int]:
-        """清除由 persona 语料导入生成的 Facts/L3 块/关联边。
+        """清除由 persona 语料导入生成的长期记忆块/关联边。
 
         参数:
             person_id:         用户 ID（通常是 persona_global）
             chunk_key_prefix:  文档块的 key 前缀
 
         返回:
-            dict: {"facts": 删除的 Facts 数, "relations": 删除的关联边数,
-                   "l3_facts": 删除的 L3 块数}
+            dict: {"l3_facts": 删除的块数, "relations": 删除的关联边数}
 
         用途：
           重新导入语料时（ingest --reset），需要先清除所有由旧语料派生的记忆。
         """
         pid = str(person_id or "").strip()
-        stats = {"facts": 0, "relations": 0, "l3_facts": 0}
+        stats = {"l3_facts": 0, "relations": 0}
         if not pid:
             return stats
-        rows = self.list_facts_detailed("", pid, limit=500)
-        fact_ids = [int(r["id"]) for r in rows if r.get("id") is not None]
-        if fact_ids:
-            from app.memory.relations import fact_key
-
-            rel_keys = [fact_key(fid) for fid in fact_ids]
-            stats["relations"] += self.delete_relations_for_keys(rel_keys)
-            stats["facts"] = self.delete_facts_by_ids(fact_ids)
         with self._conn() as conn:
             chunk_rows = conn.execute(
                 """
                 SELECT chunk_id FROM l3_chunks
-                WHERE collection='facts' AND person_id=?
+                WHERE (collection='facts' OR chunk_id LIKE ?) AND person_id=?
                 """,
-                (pid,),
+                (f"{chunk_key_prefix}%", pid),
             ).fetchall()
             for row in chunk_rows:
                 cid = str(row["chunk_id"])
@@ -1056,6 +1021,33 @@ class SessionStore:
             return None
         return dict(row)
 
+    def has_recent_emotional_event(self, person_id: str, title: str, hours: int = 24) -> bool:
+        """检查当天是否已记录过相同标题的情感事件（用于去重）。
+
+        Args:
+            person_id: 用户 ID
+            title:     情感事件标题
+            hours:     回溯时间窗口（小时），默认 24
+
+        Returns:
+            True 如果已存在。
+        """
+        if not person_id or not title:
+            return False
+        from datetime import datetime, timedelta, timezone
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM l3_chunks
+                WHERE person_id=? AND source='emotional_event_turn'
+                  AND created_at >= ? AND text LIKE ?
+                LIMIT 1
+                """,
+                (str(person_id).strip(), cutoff, f"%{title}%"),
+            ).fetchone()
+        return row is not None
+
     def l3_delete_chunk(self, chunk_id: str) -> bool:
         """删除指定的 L3 向量块及其全文索引，返回是否成功删除。"""
         with self._conn() as conn:
@@ -1084,10 +1076,10 @@ class SessionStore:
         needle = text.strip()
         if not needle:
             return []
-        collections = [collection] if collection else ["memory", "corpus", "facts"]
+        collections = [collection] if collection else ["memory", "corpus"]
         found: list[dict] = []
         for coll in collections:
-            if coll in ("memory", "facts") and device_id:
+            if coll == "memory" and device_id:
                 rows = self.l3_list_chunks(coll, device_id=device_id)
             else:
                 rows = self.l3_list_chunks(coll)
@@ -1858,7 +1850,7 @@ class SessionStore:
         *,
         category: str,
         content: str,
-        source: str = "admin_manual",
+        source: str = "manual",
     ) -> bool:
         """更新指定 L0 记录的类别与内容（重算 content_hash）。"""
         import hashlib
@@ -1959,6 +1951,209 @@ class SessionStore:
         return [dict(r) for r in rows]
 
     # ============================
+    # 后台管理辅助方法
+    # ============================
+
+    def list_all_sessions(self, limit: int = 50, offset: int = 0, status: str | None = None) -> list[dict]:
+        """后台管理：列出所有会话（分页）。"""
+        where = "WHERE 1=1"
+        params: list[str] = []
+        if status:
+            where += " AND status=?"
+            params.append(status)
+        params.append(str(limit))
+        params.append(str(offset))
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, device_id, status, created_at, last_active,
+                       active_person_id, guest_turn_count, interlocutor_mode
+                FROM sessions {where}
+                ORDER BY last_active DESC LIMIT ? OFFSET ?
+                """,
+                params,
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_sessions(self, status: str | None = None) -> int:
+        """统计会话数量。"""
+        where = "WHERE 1=1"
+        params: list[str] = []
+        if status:
+            where += " AND status=?"
+            params.append(status)
+        with self._conn() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) AS n FROM sessions {where}", params
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def get_session_by_id(self, session_id: str) -> dict | None:
+        """后台管理：获取单个会话详情。"""
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT id, device_id, status, created_at, last_active,
+                       active_person_id, guest_turn_count, interlocutor_mode
+                FROM sessions WHERE id=?
+                """,
+                (session_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_episodic_for_person_admin(self, person_id: str, *, limit: int = 20) -> list[dict]:
+        """后台管理：按用户列出情景摘要。"""
+        pid = str(person_id or "").strip()
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, device_id, person_id, session_id, summary, topics, open_loops,
+                       created_at, expires_at, archived, emotion, importance, people, status
+                FROM episodic_memories
+                WHERE person_id=?
+                ORDER BY created_at DESC LIMIT ?
+                """,
+                (pid, int(limit)),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_episodic_for_person(self, person_id: str) -> int:
+        """后台管理：统计指定用户情景摘要数量。"""
+        pid = str(person_id or "").strip()
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM episodic_memories WHERE person_id=?",
+                (pid,),
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def get_episodic_by_id(self, episodic_id: int) -> dict | None:
+        """后台管理：获取单条 L2 情景记忆。"""
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT id, device_id, person_id, session_id, summary, topics, open_loops,
+                       created_at, expires_at, archived, emotion, importance, people, status
+                FROM episodic_memories WHERE id=?
+                """,
+                (episodic_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def delete_episodic_by_id(self, episodic_id: int) -> bool:
+        """后台管理：删除单条 L2 情景记忆。"""
+        with self._conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM episodic_memories WHERE id=?", (episodic_id,)
+            )
+            return cur.rowcount > 0
+
+    def update_episodic_admin(
+        self, episodic_id: int, **kwargs
+    ) -> bool:
+        """后台管理：更新 L2 情景记忆字段。"""
+        allowed = {"summary", "topics", "emotion", "importance", "status"}
+        updates = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
+        if not updates:
+            return False
+        sets = ", ".join(f"{k}=?" for k in updates)
+        vals = list(updates.values()) + [episodic_id]
+        with self._conn() as conn:
+            cur = conn.execute(
+                f"UPDATE episodic_memories SET {sets} WHERE id=?", vals
+            )
+            return cur.rowcount > 0
+
+    def l3_list_chunks_detailed(
+        self, collection: str | None = None, person_id: str | None = None,
+        *, limit: int = 100, offset: int = 0,
+    ) -> list[dict]:
+        """后台管理：列出 L3 向量块（含 source/category/confidence/created_at）。"""
+        where = "WHERE 1=1"
+        params: list[str] = []
+        if collection:
+            where += " AND collection=?"
+            params.append(collection)
+        if person_id:
+            where += " AND person_id=?"
+            params.append(str(person_id))
+        params.append(str(limit))
+        params.append(str(offset))
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT chunk_id, text, collection, device_id, person_id,
+                       source, category, confidence, created_at
+                FROM l3_chunks {where}
+                ORDER BY created_at DESC LIMIT ? OFFSET ?
+                """,
+                params,
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_l3_for_person(self, person_id: str) -> int:
+        """后台管理：统计指定用户长期记忆块数量。"""
+        pid = str(person_id or "").strip()
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM l3_chunks WHERE person_id=?",
+                (pid,),
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def list_memory_relations_admin(self, *, limit: int = 120) -> list[dict]:
+        """后台管理：列出关联图边，用于关系图谱可视化。"""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT from_id, to_id, relation_type, strength, created_at
+                FROM memory_relations
+                ORDER BY strength DESC, created_at DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def l3_update_chunk(self, chunk_id: str, *, text: str | None = None,
+                        category: str | None = None) -> bool:
+        """后台管理：更新 L3 向量块文本（同时更新 FTS5 索引）。"""
+        updates: dict[str, object] = {}
+        if text is not None:
+            updates["text"] = text
+            updates["text_fts"] = text
+        if category is not None:
+            updates["category"] = str(category).strip()
+        if not updates:
+            return False
+        sets = ", ".join(f"{k}=?" for k in updates)
+        vals = list(updates.values()) + [chunk_id]
+        with self._conn() as conn:
+            cur = conn.execute(
+                f"UPDATE l3_chunks SET {sets} WHERE chunk_id=?", vals
+            )
+            ok = cur.rowcount > 0
+            if ok and text is not None:
+                conn.execute(
+                    "UPDATE l3_chunks_fts SET text_fts=? WHERE chunk_id=?",
+                    (text, chunk_id),
+                )
+            return ok
+
+    def count_memory_stat(self) -> dict:
+        """后台管理：统计各记忆数量和活跃会话数。"""
+        with self._conn() as conn:
+            l0 = conn.execute("SELECT COUNT(*) FROM l0_core_memories").fetchone()[0]
+            l2 = conn.execute("SELECT COUNT(*) FROM episodic_memories WHERE archived=0").fetchone()[0]
+            l2_total = conn.execute("SELECT COUNT(*) FROM episodic_memories").fetchone()[0]
+            l3 = conn.execute("SELECT COUNT(*) FROM l3_chunks").fetchone()[0]
+            profiles = conn.execute("SELECT COUNT(*) FROM person_profiles").fetchone()[0]
+        return {
+            "core_memories": l0, "episodes_active": l2, "episodes_total": l2_total,
+            "long_term_memory": l3, "profiles": profiles,
+        }
+
+    # ============================
     # 画像批量操作
     # ============================
 
@@ -1970,18 +2165,34 @@ class SessionStore:
         with self._conn() as conn:
             rows = conn.execute(
                 """
-                SELECT person_id, device_id, profile_json, updated_at
+                SELECT
+                    rowid,
+                    CAST(person_id AS BLOB) AS person_id_blob,
+                    CAST(device_id AS BLOB) AS device_id_blob,
+                    profile_json,
+                    CAST(updated_at AS BLOB) AS updated_at_blob
                 FROM person_profiles ORDER BY updated_at DESC
                 """
             ).fetchall()
         out: list[dict] = []
         for r in rows:
+            rowid = int(r["rowid"])
+            person_id = _decode_text_cell(r["person_id_blob"], column="person_id", rowid=rowid)
+            device_id = _decode_text_cell(r["device_id_blob"], column="device_id", rowid=rowid)
+            updated_at = _decode_text_cell(r["updated_at_blob"], column="updated_at", rowid=rowid)
+            if person_id is None or device_id is None or updated_at is None:
+                continue
+            try:
+                profile = json.loads(r["profile_json"])
+            except (TypeError, json.JSONDecodeError):
+                logger.warning("跳过损坏的人物画像 JSON rowid=%s person_id=%s", rowid, person_id)
+                continue
             out.append(
                 {
-                    "person_id": r["person_id"],
-                    "device_id": r["device_id"],
-                    "profile": json.loads(r["profile_json"]),
-                    "updated_at": r["updated_at"],
+                    "person_id": person_id,
+                    "device_id": device_id,
+                    "profile": profile,
+                    "updated_at": updated_at,
                 }
             )
         return out
@@ -2006,14 +2217,14 @@ class SessionStore:
     def list_facts_since(
         self, person_id: str, since_iso: str, *, limit: int = 60
     ) -> list[dict]:
-        """获取用户在指定时间点后创建的事实记录（用于 Profile 增量更新）。"""
+        """获取用户在指定时间点后创建的长期记忆块（替换旧 Facts 表，用于 Profile 增量更新）。"""
         pid = str(person_id or "").strip()
         with self._conn() as conn:
             rows = conn.execute(
                 """
-                SELECT fact, category, confidence, created_at FROM semantic_facts
+                SELECT text AS fact, category, confidence, created_at FROM l3_chunks
                 WHERE person_id=? AND created_at >= ?
-                ORDER BY id DESC LIMIT ?
+                ORDER BY rowid DESC LIMIT ?
                 """,
                 (pid, since_iso, limit),
             ).fetchall()
@@ -2033,9 +2244,7 @@ class SessionStore:
         return [str(r["person_id"]) for r in rows]
 
     def get_person_device_id(self, person_id: str) -> str:
-        """获取用户关联的设备 ID（优先从画像表，回退到 facts 表）。
-
-        用于后台管理操作时确定更新画像应绑定的 device_id。
+        """获取用户关联的设备 ID（从画像表获取）。
         """
         pid = str(person_id or "").strip()
         with self._conn() as conn:
@@ -2045,26 +2254,84 @@ class SessionStore:
             ).fetchone()
             if row and row["device_id"]:
                 return str(row["device_id"])
+        return ""
+
+    # ============================
+    # 关系状态管理（Relationship State）
+    # ============================
+
+    def save_relationship_state(self, person_id: str, state_json: str) -> None:
+        """保存或更新关系状态。
+
+        参数:
+            person_id:  用户 ID
+            state_json: 关系状态的 JSON 字符串
+        """
+        pid = str(person_id or "").strip()
+        if not pid or not state_json:
+            return
+        now = _utc_now()
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO relationship_states(person_id, state_json, created_at, updated_at)
+                VALUES (?,?,?,?)
+                ON CONFLICT(person_id) DO UPDATE SET
+                    state_json=excluded.state_json,
+                    updated_at=excluded.updated_at
+                """,
+                (pid, state_json, now, now),
+            )
+
+    def get_relationship_state(self, person_id: str) -> str | None:
+        """获取用户的关系状态 JSON。
+
+        参数:
+            person_id: 用户 ID
+
+        返回:
+            JSON 字符串，不存在返回 None。
+        """
+        pid = str(person_id or "").strip()
+        if not pid:
+            return None
+        with self._conn() as conn:
             row = conn.execute(
-                "SELECT device_id FROM semantic_facts WHERE person_id=? LIMIT 1",
+                "SELECT state_json FROM relationship_states WHERE person_id=?",
                 (pid,),
             ).fetchone()
-        return str(row["device_id"]) if row and row["device_id"] else ""
+        if not row or not row["state_json"]:
+            return None
+        return str(row["state_json"])
 
     def list_person_profiles(self, device_id: str) -> list[dict]:
         """列出指定设备的所有用户画像数据。"""
         with self._conn() as conn:
             rows = conn.execute(
                 """
-                SELECT person_id, profile_json, updated_at FROM person_profiles
+                SELECT
+                    rowid,
+                    CAST(person_id AS BLOB) AS person_id_blob,
+                    profile_json,
+                    CAST(updated_at AS BLOB) AS updated_at_blob
+                FROM person_profiles
                 WHERE device_id=? ORDER BY updated_at DESC
                 """,
                 (device_id,),
             ).fetchall()
         out: list[dict] = []
         for r in rows:
-            profile = json.loads(r["profile_json"])
-            out.append({"person_id": r["person_id"], "profile": profile, "updated_at": r["updated_at"]})
+            rowid = int(r["rowid"])
+            person_id = _decode_text_cell(r["person_id_blob"], column="person_id", rowid=rowid)
+            updated_at = _decode_text_cell(r["updated_at_blob"], column="updated_at", rowid=rowid)
+            if person_id is None or updated_at is None:
+                continue
+            try:
+                profile = json.loads(r["profile_json"])
+            except (TypeError, json.JSONDecodeError):
+                logger.warning("跳过损坏的人物画像 JSON rowid=%s person_id=%s", rowid, person_id)
+                continue
+            out.append({"person_id": person_id, "profile": profile, "updated_at": updated_at})
         return out
 
     # ============================
@@ -2084,7 +2351,7 @@ class SessionStore:
         操作流程（全部在一个事务内）：
           1. 校验 old_id 存在、new_id 不冲突
           2. 删除旧画像，插入新画像（person_id 改为 new_id）
-          3. 更新 episodic_memories, semantic_facts, l3_chunks,
+          3. 更新 episodic_memories, l3_chunks,
              l0_core_memories, l3_recall_stats 中的 person_id
           4. 更新 sessions 表中的 active_person_id
 
@@ -2134,7 +2401,6 @@ class SessionStore:
             # 级联更新所有记忆表
             for table in (
                 "episodic_memories",
-                "semantic_facts",
                 "l3_chunks",
                 "l0_core_memories",
                 "l3_recall_stats",
@@ -2160,18 +2426,17 @@ class SessionStore:
 
         返回:
             dict: {"memory_relations": ..., "l3_chunks": ..., "episodic_memories": ...,
-                   "semantic_facts": ..., "l0_core_memories": ..., "l3_recall_stats": ...,
+                   "l0_core_memories": ..., "l3_recall_stats": ...,
                    "person_profiles": ..., "sessions": ...}
 
         删除范围：
-          1. 找到该用户的所有 Facts → 收集 fact key
-          2. 找到该用户的所有 L3 chunks → 收集 chunk key
-          3. 删除所有关联图的边
-          4. 删除 L3 块（同时清理 FTS5 索引）
-          5. 删除 L2/Facts/L0/recall_stats 记录
-          6. 删除画像
-          7. 清除活跃会话中的 person 绑定
-          8. 清除 identity_pending 中的相关记录
+          1. 找到该用户的所有长期记忆块 → 收集 chunk key
+          2. 删除所有关联图的边
+          3. 删除长期记忆块（同时清理 FTS5 索引）
+          4. 删除情景摘要/L0/recall_stats 记录
+          5. 删除画像
+          6. 清除活跃会话中的 person 绑定
+          7. 清除 identity_pending 中的相关记录
         """
         pid = str(person_id or "").strip()
         if not pid:
@@ -2183,26 +2448,20 @@ class SessionStore:
             ).fetchone():
                 raise ValueError("person not found")
 
-            # 收集要清理的 facts 和 chunks 的 key
-            fact_rows = conn.execute(
-                "SELECT id FROM semantic_facts WHERE person_id=?",
-                (pid,),
-            ).fetchall()
+            # 收集要清理的 chunk key
             chunk_rows = conn.execute(
                 "SELECT chunk_id FROM l3_chunks WHERE person_id=?",
                 (pid,),
             ).fetchall()
 
-        fact_ids = [int(r["id"]) for r in fact_rows if r["id"] is not None]
         chunk_ids = [str(r["chunk_id"]) for r in chunk_rows if r["chunk_id"]]
 
         # 删除关联图边
         rel_deleted = 0
-        if fact_ids or chunk_ids:
-            from app.memory.relations import chunk_key, fact_key
+        if chunk_ids:
+            from app.memory.relations import chunk_key
 
-            rel_keys = [fact_key(fid) for fid in fact_ids]
-            rel_keys.extend(chunk_key(cid) for cid in chunk_ids)
+            rel_keys = [chunk_key(cid) for cid in chunk_ids]
             rel_deleted = self.delete_relations_for_keys(rel_keys)
 
         counts: dict[str, int] = {"memory_relations": rel_deleted, "l3_chunks": 0}
@@ -2216,7 +2475,6 @@ class SessionStore:
             # 删除所有关联的记忆表数据
             for table in (
                 "episodic_memories",
-                "semantic_facts",
                 "l0_core_memories",
                 "l3_recall_stats",
             ):
@@ -2256,6 +2514,86 @@ class SessionStore:
             if pending_cleared:
                 counts["sessions_pending_cleared"] = pending_cleared
         return counts
+
+    # ============================
+    # Open Loop 管理
+    # ============================
+
+    def create_open_loop(self, person_id: str, title: str, **kwargs) -> int | None:
+        """创建一条待跟进事项。"""
+        pid = str(person_id or "").strip()
+        ttl = (title or "").strip()
+        if not pid or not ttl:
+            return None
+        now = _utc_now()
+        with self._conn() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO open_loops(
+                    person_id, title, status, due_hint, emotional_weight,
+                    created_at, last_mentioned_at, cooldown_until, source_session_id
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    pid, ttl, "open",
+                    str(kwargs.get("due_hint", "")),
+                    int(kwargs.get("emotional_weight", 3)),
+                    now, now, "",
+                    str(kwargs.get("source_session_id", "")),
+                ),
+            )
+            return int(cur.lastrowid) if cur.lastrowid else None
+
+    def resolve_open_loop(self, loop_id: int, evidence: str = "") -> bool:
+        """将待跟进事项标记为已解决。"""
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE open_loops SET status='done', resolved_evidence=? WHERE id=? AND status='open'",
+                (evidence, loop_id),
+            )
+            return cur.rowcount > 0
+
+    def list_open_loops(
+        self, person_id: str, *, status: str = "open", limit: int = 10,
+    ) -> list[dict]:
+        """列出用户的待跟进事项。"""
+        pid = str(person_id or "").strip()
+        if not pid:
+            return []
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, title, status, due_hint, emotional_weight, created_at,
+                       last_mentioned_at, cooldown_until, source_session_id
+                FROM open_loops
+                WHERE person_id=? AND status=?
+                ORDER BY emotional_weight DESC, created_at DESC
+                LIMIT ?
+                """,
+                (pid, status, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_open_loop_mentioned(self, loop_id: int) -> None:
+        """更新待跟进事项的最后提及时间（冷却计时重置）。"""
+        now = _utc_now()
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE open_loops SET last_mentioned_at=? WHERE id=?",
+                (now, loop_id),
+            )
+
+    def count_open_loops(self, person_id: str) -> int:
+        """统计用户当前待跟进事项数量。"""
+        pid = str(person_id or "").strip()
+        if not pid:
+            return 0
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM open_loops WHERE person_id=? AND status='open'",
+                (pid,),
+            ).fetchone()
+        return int(row["n"]) if row else 0
 
 
 # 全局单例：所有模块通过 `from app.session import store` 引用

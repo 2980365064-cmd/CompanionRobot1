@@ -15,6 +15,9 @@ SparkBot Personal Agent 的 Python FastAPI 后端。通过 WebSocket 长连接�
 pip install -r requirements.txt
 cp .env.example .env   # 填入 LLM_API_KEY（DeepSeek）和 EMBED_API_KEY（阿里云 DashScope）
 
+虚拟环境：python3 -m venv venv
+source venv/bin/activate
+
 # 启动（推荐方式——仅显示 Agent 监控日志）
 python -m app.main
 
@@ -34,6 +37,11 @@ python scripts/eval_agent.py         # Agent 端到端评估
 python scripts/diagnose_memory.py    # 记忆系统诊断（检查各层数据一致性）
 python scripts/e2e_pipeline_test.py  # 端到端管线测试
 python scripts/test_scheme_a_chain.py # 对比测试方案 A 链路
+
+# 情感陪伴评测（覆盖 6 维度 × 26 测试用例）
+python scripts/eval_emotional_memory.py                  # 离线规则模式
+python scripts/eval_emotional_memory.py --online          # 在线模式（需后端运行）
+python scripts/eval_emotional_memory.py --offline-static  # 静态 Prompt 检查（无工程词检查）
 
 # 微信数据导入
 python scripts/import_wechat.py --private    # 微信单聊导入（隐私数据，不提交）
@@ -64,7 +72,13 @@ docker compose up -d --build
 |---|---|---|---|
 | **L0 Core** | `l0_core_memories` 表 | 全量注入每轮 system prompt | `memory/l0.py` |
 | **L1 Working** | `messages` 表（本会话窗口） | 最近 N 轮拼入 messages | `memory/l1.py` |
-| **L2 Episodic** | `episodic_memories` 表 | 向量检索后注入，7天过期归档 | `memory/l2.py` |
+| **L2 Episodic** | `episodic_memories` 表 | 向量检索后注入，14天过期归档（含重要性加权） | `memory/l2.py` |
+| **L3 Corpus** | `l3_chunks` + FTS5 | 混合检索（向量+全文），永久存储 | `memory/l3.py` |
+| **Profile** | `person_profiles` 表（JSON） | 格式化后注入 prompt | `memory/profile.py` |
+
+> **2026-07-02 重构：L2 保留期从 7→14 天，增加 importance(1-5) 和 people 字段。高重要性事件(>=4)不受过期限制。**
+
+**记忆流转**：L1(本轮) → L1压缩→ L2(14天摘要，高重要性永久) → 到期归档→ L3(永久) → 高频提升→ L0
 | **L3 Corpus** | `l3_chunks` + FTS5 | 混合检索（向量+全文），永久存储 | `memory/l3.py` |
 | **Profile** | `person_profiles` 表（JSON） | 格式化后注入 prompt | `memory/profile.py` |
 
@@ -81,7 +95,7 @@ docker compose up -d --build
 
 单文件 SQLite `agent.db`，WAL 模式，8MB 缓存。全局单例 `store = SessionStore()`。所有 DB 操作是同步的，调用方通过 `asyncio.to_thread()` 在后台线程执行。
 
-核心表：`sessions`, `messages`, `episodic_memories`, `semantic_facts`, `l3_chunks` + `l3_chunks_fts`(FTS5), `l0_core_memories`, `person_profiles`, `memory_relations`, `l3_recall_stats`
+核心表：`sessions`, `messages`, `episodic_memories`, `l3_chunks` + `l3_chunks_fts`(FTS5), `l0_core_memories`, `person_profiles`, `memory_relations`, `l3_recall_stats`
 
 Schema 迁移是增量的：各 `_migrate_*` 方法检测列是否存在再 ALTER TABLE，不需要手动迁移。
 
@@ -111,7 +125,27 @@ pydantic-settings 自动加载 `.env`，全局单例 `settings`。所有路径�
 
 ### 控制台监控 (`app/monitor.py`)
 
-静音所有第三方库日志，仅通过 `agent` logger 通道输出结构化监控信息。在 `python -m app.main` 启动时每轮对话都会打印记忆命中情况和耗时。
+**阶段 3.0**：升级为"记忆测试驾驶舱"，支持 4 种日志模式：
+
+| 模式 | 行为 |
+|------|------|
+| `silent` | 仅显示启动和错误信息 |
+| `normal` | 每轮 box-drawing 核心链路（身份/记忆/回复/耗时/后台事件） |
+| `debug` | 详细展开 MemoryPackV2、Consolidator 裁决、Prompt 摘要 |
+| `trace` | 显示底层召回候选项 |
+
+配置方式（`.env`）：
+```
+CONSOLE_LOG_MODE=debug
+CONSOLE_LOG_MEMORY_DETAIL=true
+CONSOLE_LOG_PROMPT_PREVIEW=false
+CONSOLE_LOG_TIMING=true
+CONSOLE_LOG_WIDTH=100
+```
+
+`python -m app.main` 启动后每轮对话打印：
+- normal 模式：`╭─ Turn #42 · 14:03:18 · web-admin` 风格输出
+- debug 模式：额外显示 MemoryPackV2 细节、Prompt 工程词检查、Consolidator 完整结果
 
 ## 模块速查
 
@@ -125,7 +159,12 @@ pydantic-settings 自动加载 `.env`，全局单例 `settings`。所有路径�
 | `app/ws_handler.py` | WebSocket 协议处理（hello/chat/session_end 等） |
 | `app/monitor.py` | 控制台监控输出（记忆命中、耗时、后台事件） |
 | `app/tts.py` | 百度 TTS 语音合成 + 声音复刻 |
-| `app/memory/router.py` | MemoryRouter 记忆召回调度中心 |
+| `app/memory/router.py` | MemoryRouter 记忆召回调度中心（底层） |
+| `app/memory/schema.py` | **记忆统一语义层** — MemoryItem/MemoryKind/MemoryPackV2 等核心数据结构，所有新模块基于此 schema |
+| `app/memory/orchestrator.py` | **Memory Orchestrator — 记忆编排器**，将 L0/L2/L3 统一转换为 MemoryPack（5 类产品记忆），支持 V2 转换 |
+| `app/memory/relationship_state.py` | **关系状态持久化** — 每轮更新关系温度/情绪趋势/态度/关心点/避雷点 |
+| `app/memory/open_loops.py` | **结构化 Open Loop 管理器** — 待办事项检测/创建/解决/冷却，替代 L2 硬解析 |
+| `app/memory/emotional_events.py` | **情感事件抽取器** — 从 L2 和对话中提取高重要性情感事件 |
 | `app/memory/l0.py` | L0 核心记忆提取与格式化 |
 | `app/memory/l1.py` | L1 工作记忆（消息滑动窗口） |
 | `app/memory/l2.py` | L2 情景记忆向量检索 |
@@ -139,6 +178,7 @@ pydantic-settings 自动加载 `.env`，全局单例 `settings`。所有路径�
 | `app/memory/emotion.py` | 情感轨迹追踪 |
 | `app/memory/contacts.py` | 第三方人物画像管理 |
 | `app/memory/correction.py` | 记忆自动修正（用户纠错触发） |
+| `app/memory/consolidator.py` | **MemoryConsolidator — 统一写入仲裁器**，每轮分类后裁决记忆沉淀 + 关系状态 + Open Loop |
 | `app/memory/self_state.py` | 机器人自我状态管理 |
 | `app/persona/card.py` | 机器人人格卡片加载（persona.md） |
 | `app/persona/ingest.py` | 语料分块/入库/降噪 |

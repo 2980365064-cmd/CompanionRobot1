@@ -173,9 +173,9 @@ def _detect_intent_boosts(query: str) -> dict[str, float]:
     if any(w in q for w in ("待跟进", "待办", "还有什", "该做", "要做什么")):
         boosts["open_loop"] = max(boosts.get("open_loop", 0), 0.12)
 
-    # 月份/年份回忆识别
+    # 月份/年份回忆识别：覆盖 2025年6月 / 2025-6月 / 2025-06 / 6月 / June 2025
     import re
-    if re.search(r"\d{4}年", q):
+    if re.search(r"\d{4}\s*[年/-]\s*\d{1,2}\s*月?|\d{4}年", q):
         boosts["monthly"] = max(boosts.get("monthly", 0), 0.10)
 
     return boosts

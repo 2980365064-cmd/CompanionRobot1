@@ -193,19 +193,42 @@ def _cn_month_to_int(token: str) -> int | None:
 
 
 def _parse_month_key(query: str) -> str | None:
-    """Extract YYYY-MM when user asks about a specific month."""
+    """提取用户查询中的月份，归一化为 YYYY-MM。
+
+    支持的输入格式：
+      - 2025年6月, 2025年06月
+      - 2025-6月, 2025-06月, 2025-6, 2025-06
+      - 2025 年 6 月（空格分隔）
+      - 二〇二五年六月（中文全数字）
+    """
     import re
 
     q = query.strip()
-    m = re.search(r"(\d{4})\s*年\s*(?:(\d{1,2})|([一二三四五六七八九十]{1,2}))月", q)
+
+    # 1. 2025年6月 / 2025年06月 / 2025年六月
+    m = re.search(r"(\d{4})\s*年\s*(?:(\d{1,2})|([一二三四五六七八九十]{1,2}))\s*月", q)
     if m:
         year = int(m.group(1))
         month = _cn_month_to_int(m.group(2) or m.group(3) or "")
-        if month:
+        if month and 1 <= month <= 12:
             return f"{year}-{month:02d}"
-    m2 = re.search(r"(\d{4})-(\d{2})", q)
+
+    # 2. 2025-6月 / 2025-06月 / 2025-6 / 2025-06
+    m2 = re.search(r"(\d{4})\s*-\s*(\d{1,2})\s*月?", q)
     if m2:
-        return f"{m2.group(1)}-{m2.group(2)}"
+        year = int(m2.group(1))
+        month = int(m2.group(2))
+        if 1 <= month <= 12:
+            return f"{year}-{month:02d}"
+
+    # 3. 2025 年 6 月（空格分隔）
+    m3 = re.search(r"(\d{4})\s+年\s+(\d{1,2})\s+月", q)
+    if m3:
+        year = int(m3.group(1))
+        month = int(m3.group(2))
+        if 1 <= month <= 12:
+            return f"{year}-{month:02d}"
+
     return None
 
 
@@ -231,15 +254,41 @@ def _build_l3_query(query: str, working: list[dict], self_name: str | None) -> s
 
 
 def _chunk_section_month(text: str) -> str | None:
-    """Primary YYYY-MM section tag from an L3 chunk heading."""
+    """从 L3 chunk 文本中提取月份标识 YYYY-MM。
+
+    支持的格式：
+      - ## YYYY-MM（标准 Markdown 标题）
+      - # YYYY-MM 月度记忆
+      - [时间: YYYY-MM]（元数据标签）
+      - time: YYYY-MM / 时间：YYYY-MM
+    """
     import re
 
-    m = re.search(r"## (\d{4}-\d{2})\b", text or "")
-    return m.group(1) if m else None
+    # 1. ## YYYY-MM 或 # YYYY-MM 月度记忆
+    m = re.search(r"(?:##|#|\*\*)\s*(\d{4}-\d{2})\b", text or "")
+    if m:
+        return m.group(1)
+
+    # 2. [时间: YYYY-MM] 或 [time: YYYY-MM]
+    m = re.search(r"(?:时间|time)\s*[:：]\s*(\d{4}-\d{2})\b", text or "")
+    if m:
+        return m.group(1)
+
+    return None
 
 
-def _is_month_primary_chunk(text: str, mk: str) -> bool:
-    return _chunk_section_month(text) == mk
+def _is_month_primary_chunk(text: str, source: str, mk: str) -> bool:
+    """判断 L3 chunk 是否属于指定月份。
+
+    检查顺序：
+      1. 文本内标题匹配（## YYYY-MM / [时间: YYYY-MM]）
+      2. source 路径包含 monthly/.../YYYY-MM.md
+    """
+    if _chunk_section_month(text) == mk:
+        return True
+    if f"/{mk}.md" in source or f"{mk}.md" in source:
+        return True
+    return False
 
 
 def _boost_month_l3_matches(
@@ -249,10 +298,24 @@ def _boost_month_l3_matches(
     person_id: str,
     persona_person_id: str,
 ) -> list[dict]:
-    """When user names a month, prefer chunks whose ## heading matches YYYY-MM."""
+    """When user names a month, prefer chunks whose ## heading matches YYYY-MM.
+
+    优先级（从高到低）：
+      1. monthly/liu_yuanhui/YYYY-MM.md 和 events/relationship/*YYYY-MM*
+         （用户问"我俩之间"或未指定第三方时）
+      2. monthly/friends_group/YYYY-MM.md
+         （用户问唐凯/伍钰涛/朋友群时）
+      3. 其他命中 chunk
+    """
+    import re as _re
+
     mk = _parse_month_key(query)
     if not mk:
         return matches
+
+    # 检测是否在问朋友/第三方
+    asks_about_friend = bool(_re.search(r"唐凯|伍钰涛|朋友|朋友群|兄弟们", query))
+    asks_about_relationship = bool(_re.search(r"我俩|我们之间|我们俩|远慧|和她|我跟他?", query))
 
     def month_bucket(m: dict) -> int:
         sm = _chunk_section_month(str(m.get("text", "")))
@@ -262,14 +325,37 @@ def _boost_month_l3_matches(
             return 2
         return 1
 
-    on_month = [m for m in matches if _is_month_primary_chunk(str(m.get("text", "")), mk)]
+    def source_priority(m: dict) -> int:
+        """返回排序优先级：0=最优先, 1=中性, 2=最低。"""
+        src = str(m.get("source", "")).strip()
+        cat = str(m.get("category", "")).strip()
+        text = str(m.get("text", ""))[:200]
+
+        is_relationship = "monthly/liu_yuanhui/" in src or "events/relationship/" in src
+        is_event = cat in ("monthly", "event")
+        is_friends = "monthly/friends_group/" in src or "唐凯" in text or "伍钰涛" in text
+
+        if asks_about_friend and not asks_about_relationship:
+            return 0 if is_friends else (1 if is_relationship else 2)
+        if asks_about_relationship and not asks_about_friend:
+            return 0 if is_relationship else (1 if is_friends else 2)
+        # 未明确指定时：relationship > friends > 其他
+        return 0 if is_relationship else (1 if is_friends else 2)
+
+    on_month = [m for m in matches if _is_month_primary_chunk(str(m.get("text", "")), str(m.get("source", "")), mk)]
+    # 按优先级排序
+    on_month.sort(key=source_priority)
     if len(on_month) >= 2:
         neutral = [m for m in matches if month_bucket(m) == 1]
+        neutral.sort(key=source_priority)
         return (on_month + neutral)[: max(5, len(matches))]
 
     extras = [persona_person_id] if persona_person_id else []
+    year, month_num = mk.split("-")
+    month_cn = {v: k for k, v in _CN_MONTHS.items() if v <= 12}.get(int(month_num), "")
+    fts_query = f"{mk} {year}年{int(month_num)}月 {month_cn}月 monthly/{year}-{month_num}"
     fts_rows = store.l3_fts_search_pool(
-        mk,
+        fts_query,
         person_id,
         extra_person_ids=extras,
         limit=12,
@@ -278,7 +364,7 @@ def _boost_month_l3_matches(
     seen = {str(m.get("text", "")).strip() for m in matches if m.get("text")}
     for row in fts_rows:
         text = str(row.get("text", "")).strip()
-        if not text or text in seen or not _is_month_primary_chunk(text, mk):
+        if not text or text in seen or not _is_month_primary_chunk(text, str(row.get("source", "")), mk):
             continue
         seen.add(text)
         injected.append(
@@ -293,7 +379,9 @@ def _boost_month_l3_matches(
         )
 
     neutral = [m for m in matches if month_bucket(m) == 1]
+    neutral.sort(key=source_priority)
     on_month_vec = [m for m in on_month if m not in injected]
+    on_month_vec.sort(key=source_priority)
     merged = injected + on_month_vec + neutral
     return merged[: max(5, len(matches))]
 
@@ -454,7 +542,7 @@ class MemoryRouter:
             # 例如 persona/corpus/ 中的通用人物百科，不属于特定用户，
             # 但对所有实名用户都有参考价值。
             persona_pid = str(getattr(settings, "persona_fact_person_id", "") or "").strip()
-            l3_top_k = 5 if _parse_month_key(q) else 3
+            l3_top_k = 6 if _parse_month_key(q) else 3
             l3_matches = semantic_memory.recall_l3_scored(
                 device_id,
                 pid,
@@ -476,15 +564,8 @@ class MemoryRouter:
             l3_matches = [
                 m for m in l3_matches if (m.get("score") or 0) >= l3_thresh
             ]
-            mk = _parse_month_key(q)
-            if mk and needs_memory:
-                on_month = [
-                    m
-                    for m in l3_matches
-                    if _is_month_primary_chunk(str(m.get("text", "")), mk)
-                ]
-                if not on_month:
-                    l3_matches = []
+            # 月份查询不再清空未命中月份 chunk 的结果（_boost_month_l3_matches
+            # 已通过 FTS 补注），保留已有结果让 LLM 获得可用上下文。
 
         l3_hit = bool(l3_matches)
         l3_texts = [str(m["text"]) for m in l3_matches if m.get("text")]
@@ -535,6 +616,66 @@ class MemoryRouter:
                 "l3": l3_matches,
                 "related": related_matches,
             },
+            "month_key": _parse_month_key(q) or "",
+        }
+
+
+    def recall_fast(
+        self,
+        device_id: str,
+        session_id: str,
+        query: str,
+        *,
+        person_id: str | None = None,
+    ) -> dict:
+        """快速召回 —— 仅 L0+L1+最近 L2，跳过 L3、关系图和情感事件。
+
+        用于低延迟语音场景的首响：
+          - 首轮先确保回复速度（快速注入 L0/L1/L2）
+          - L3 等完整记忆通过异步后补（见 dialog_orchestrator）
+
+        参数同 recall()。
+        """
+        working = working_memory.get_recent(session_id)
+        pid = str(person_id or "").strip()
+
+        if not memory_scoped_to_person(pid):
+            return self._recall_guest(working)
+
+        q = query.strip()
+        # 快速 L2 无需 embedding：直接取最近几条摘要
+        l0_rows = list_l0_cached(pid)
+        l2_matches = episodic_memory.recall_scored(
+            device_id, pid, q,
+            settings.episodic_top_k,
+            q_emb=None,
+        )
+        l2_hit = any(m.get("score") is not None for m in l2_matches)
+        if not l2_matches:
+            l2_matches = episodic_memory.recall_scored(
+                device_id, pid, "",
+                settings.l2_recall_recent, q_emb=None,
+            )
+        episodic = [m["text"] for m in l2_matches if m.get("text")]
+
+        memory_miss = False  # fast 路径不判定 memory_miss（L3 不存在时不触发反幻觉）
+
+        return {
+            "working": working,
+            "episodic": episodic,
+            "semantic": [],
+            "l3": [],
+            "l0": l0_rows,
+            "l2_hit": l2_hit,
+            "l3_hit": False,
+            "facts_hit": False,
+            "corpus_triggered": False,
+            "corpus_reason": ["fast_recall_skip_l3"],
+            "memory_miss": memory_miss,
+            "person_id": pid,
+            "guest_mode": False,
+            "matches": {"l2": l2_matches, "l3": [], "related": []},
+            "month_key": "",
         }
 
 

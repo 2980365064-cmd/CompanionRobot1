@@ -89,12 +89,11 @@ L0_CATEGORY_LABELS: dict[str, str] = {
 
 # ── 数据来源标签 ────────────────────────────────────────────────────────────
 # 用于 is_l0_blocked 做不同来源的差异化门控：
-#   user_declared  → 用户直接陈述，门控最严
-#   profile_sync   → 画像转正同步，允许信任度最高的身份/禁忌类别通过
-#   remember_intent → 用户明确说"记住"，中等信任度
+#   user_declared    → 用户直接陈述或画像转正同步，门控一致
+#   remember_intent  → 用户明确说"记住"，中等信任度
+# 注意：profile_sync 已合并到 user_declared，旧 DB 记录已通过迁移清洗。
 
 _SOURCE_USER = "user_declared"
-_SOURCE_PROFILE = "profile_sync"
 _SOURCE_REMEMBER = "remember_intent"
 
 # 核心亲人最多存 5 人（防止溢出和提示词过长）
@@ -233,7 +232,7 @@ def is_l0_blocked(
     Args:
         content:  待存入的事实文本
         category: 目标 L0 类别（identity/taboo/key_people/milestone/preference）
-        source:   数据来源（user_declared/profile_sync/remember_intent）
+        source:   数据来源（user_declared/remember_intent）
 
     Returns:
         True 表示应阻止（不存入），False 表示可以通过。
@@ -241,9 +240,9 @@ def is_l0_blocked(
     过滤逻辑（按检查顺序）：
       1. 长度 < 2 字 ── 直接拒绝
       2. 纯寒暄噪音 ── 拒绝
-      3. 含推断标记词（可能/好像）── 拒绝（除非 profile_sync 且为身份/禁忌类）
+      3. 含推断标记词（可能/好像）── 拒绝
       4. 含 L2/L3 叙述套话 ── 拒绝
-      5. profile_sync 来源 → 身份/禁忌/带日期的里程碑 → 可信，放行
+      5. 身份/禁忌类 ── 无条件信任（用户直接陈述或画像转正均为高可信）
       6. 临时性内容检查
       7. 一次性经历检查
       8. 各类别专项检查（如 preference 验证强偏好信号等）
@@ -262,11 +261,10 @@ def is_l0_blocked(
     if _NARRATIVE_ROLLUP.search(text):
         return True
 
-    # profile_sync 来源的信任策略：身份和禁忌类无条件信任
-    # 因为 profile_sync 来自经过确认的画像，数据质量远高于用户实时消息
-    if source == _SOURCE_PROFILE and cat in (L0_IDENTITY, L0_TABOO):
+    # 用户直接陈述或画像转正的数据：身份和禁忌类无条件信任
+    if source == _SOURCE_USER and cat in (L0_IDENTITY, L0_TABOO):
         return False
-    if source == _SOURCE_PROFILE and cat == L0_MILESTONE and _FIXED_DATE.search(text):
+    if source == _SOURCE_USER and cat == L0_MILESTONE and _FIXED_DATE.search(text):
         return False
 
     # 临时计划/一次性经历 → 不进入永久记忆
@@ -276,16 +274,16 @@ def is_l0_blocked(
         return True
 
     # 各类别专项门控
-    # preference 类别：非 profile_sync 来源必须有强偏好信号词；次要偏好拒绝
+    # preference 类别：必须有强偏好信号词；次要偏好拒绝
     if cat == L0_PREFERENCE:
         if _MINOR_PREF.search(text):
             return True
-        if source != _SOURCE_PROFILE and not _CORE_PREF_STRONG.search(text):
+        if not _CORE_PREF_STRONG.search(text):
             return True
 
-    # milestone 类别：必须有固定日期信号，否则拒绝（profile_sync 来源例外）
+    # milestone 类别：必须有固定日期信号，否则拒绝
     if cat == L0_MILESTONE:
-        if not _FIXED_DATE.search(text) and source != _SOURCE_PROFILE:
+        if not _FIXED_DATE.search(text):
             return True
 
     # key_people 类别：必须有亲属关系词或纪念日类信号
@@ -664,7 +662,7 @@ def push_identity_on_profile_promotion(
         parts.append(f"与叶鹏祥的关系：{rel}")
     if parts:
         line = "；".join(parts)
-        if upsert_l0(pid, L0_IDENTITY, line, device_id=device_id, source=_SOURCE_PROFILE):
+        if upsert_l0(pid, L0_IDENTITY, line, device_id=device_id, source=_SOURCE_USER):
             saved.append(line)
     return saved
 

@@ -123,7 +123,7 @@ class Settings(BaseSettings):
     # L2（情景记忆/Episodic Memory）：
     #   最近 l2_retention_days 天的会话摘要，向量检索注入 prompt
     #   到期后由 l2_rollup_sweeper 归档到 L3 Corpus
-    l2_retention_days: int = 7           # L2 保留天数
+    l2_retention_days: int = 14           # L2 保留天数（从 7→14，支持情感近况更长感知）
     l2_recall_recent: int = 3            # 时间倒序召回条数
     l2_recall_query_k: int = 2           # 向量语义召回条数
     l2_embed_pool: int = 15              # 向量嵌入池大小（最近 N 条摘要参与向量检索）
@@ -137,8 +137,13 @@ class Settings(BaseSettings):
     l3_denoise_enabled: bool = True       # 入库时启用去噪（过滤低质量文本）
     # import_wechat 已生成叙述性月度总结时，默认 ingest；留空表示不跳过任何 corpus 文件
     l3_noise_file_patterns: str = ""
-    # L3 检索模式：always = 每轮都检索（person_id 绑定后）
-    l3_recall_mode: str = "always"
+    # L3 检索模式：
+    #   always = 每轮都检索（person_id 绑定后，原行为）
+    #   auto  = 快路径仅 L0+L1+最近 L2，首轮到回复前不等待 L3；
+    #           L3 仅当用户问明确需要记忆的问题时阻塞等待，
+    #           其余情况异步后补（目前仍同步等待，二期改为真正异步）
+    #   never = 完全跳过 L3 检索（仅 L0+L1+L2）
+    l3_recall_mode: str = "auto"
     # 是否自动从对话中提取 Facts（默认关闭，由 extractor 模组按需触发）
     auto_extract_facts: bool = False
 
@@ -253,6 +258,34 @@ class Settings(BaseSettings):
     baidu_api_key: str = ""
     # 复刻音色 ID，运行 scripts/create_voice.py 上传音频后获得
     tts_clone_voice_id: str = ""
+
+    # ============================
+    # 百度语音识别（ASR）配置
+    # ============================
+    # 百度 ASR APP ID（语音识别应用标识符）
+    baidu_asr_app_id: str = ""
+    # 百度 ASR API Key
+    baidu_asr_api_key: str = ""
+    # 百度 ASR Secret Key（与 api_key 配合获取 access_token）
+    baidu_asr_secret_key: str = ""
+    # 是否在 v2 音频协议中启用 ASR（true=语音转文字，false=仅传文本不识别）
+    asr_enabled: bool = False
+    # 百度 ASR 模型：15372=普通话(远场), 15373=粤语, 1737=英语
+    asr_dev_pid: int = 15372
+
+    # ============================
+    # 控制台日志配置（阶段 3.0）
+    # ============================
+    # 日志模式：silent=仅启动/错误, normal=核心链路, debug=详细(含MemoryPack/Prompt), trace=全部底层
+    console_log_mode: str = "normal"
+    # 是否在 normal 模式显示记忆包摘要行
+    console_log_memory_detail: bool = True
+    # debug/trace 模式是否预览 prompt 内容
+    console_log_prompt_preview: bool = False
+    # 是否显示各阶段耗时
+    console_log_timing: bool = True
+    # 控制台分隔线宽度
+    console_log_width: int = 100
 
     # ============================
     # 运行时参数

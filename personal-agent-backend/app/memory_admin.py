@@ -16,7 +16,7 @@ from app.memory.l0 import (
 from app.memory.profile import normalize_profile, profile_display_name
 from app.session import store
 
-_SOURCE_ADMIN = "admin_manual"
+_SOURCE_ADMIN = "manual"
 _MAX_KEY_PEOPLE = 5
 
 

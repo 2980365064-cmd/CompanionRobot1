@@ -1,36 +1,35 @@
 """控制台监控 —— 结构化输出每轮对话的记忆命中与后台事件。
 
-本模块的角色：
-  陪伴机器人的"黑匣子"仪表盘。在终端运行时，每轮对话都会结构化打印：
-  - 用户输入
-  - 当前对话对象（实名用户/访客/画像信息）
-  - 各记忆层命中情况（L0/L1/L2/L3/联想网络）
-  - 助手回复与耗时
-  - 后台异步事件（L1 压缩、L0 入库、记忆修正、语料同步等）
+阶段 3.0 — "记忆测试驾驶舱"
+支持四模式：
+  silent  只显示启动和错误
+  normal  显示每轮核心链路（box-drawing 风格）
+  debug   显示 MemoryPackV2、写入裁决、prompt 摘要
+  trace   显示底层召回和候选项
 
 设计原则：
-  - 静音所有第三方库（uvicorn、httpx、chromadb、openai 等）的日志噪音
-  - 仅通过 "agent" logger 通道输出 INFO 级别信息
-  - 每行格式统一，便于 grep 和人工阅读
-  - chat_memory() 的字段与 memory_router.recall() 返回值一一对应，便于调试召回链路
-
-与 app/log_config.py 的关系：
-  log_config.py 控制 Uvicorn 启动时的日志级别（WARNING），
-  本模块在 AgentMonitor.configure() 中进一步静音所有应用库日志，
-  两者配合实现"控制台只看 agent 通道"的效果。
+  - 静音所有第三方库日志噪音
+  - 仅通过 "agent" logger 通道输出 INFO 级别
+  - box-drawing 风格统一终端布局
+  - 所有时序由 agent.py 通过 set_timing() 注入，monitor 仅负责展示
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import time
+from collections import deque
+from datetime import datetime
+from typing import Any
 
-# agent 监控专用 logger 名称，与配置中静音的其他 logger 区分
+from app.config import settings
+
+# agent 监控专用 logger 名称
 _AGENT_LOGGER = "agent"
 
-# 需要静音的第三方/框架 logger 列表
-# 这些库在 DEBUG/INFO 级别会输出大量无用信息，统一设为 WARNING
+# 需要静音的第三方/框架 logger
 _QUIET_LOGGERS = (
     "uvicorn",
     "uvicorn.access",
@@ -48,72 +47,90 @@ _QUIET_LOGGERS = (
     "app.ws_handler",
 )
 
+# 工程术语检测列表（用于 prompt_summary）
+_ENGINEERING_TERMS = [
+    "L0", "L1", "L2", "L3",
+    "向量", "检索", "命中", "命中率",
+    "记忆库", "数据库中", "关联网络", "strength",
+    "FTS", "embedding", "未匹配", "无相关记录",
+]
+
 
 def _clip(text: str, n: int = 72) -> str:
-    """单行截断：合并空白后截取前 n 字符，用于控制台预览记忆片段。
-
-    记忆文本通常较长，控制台一行显示不下，截断到 72 字加省略号，
-    既保留关键信息又不撑破终端布局。
-    """
+    """单行截断：合并空白后截取前 n 字符。"""
     t = " ".join(text.split())
     return t if len(t) <= n else t[: n - 1] + "…"
 
 
 def _fmt_score(score: float | None) -> str:
-    """向量相似度格式化。
-
-    None 表示通过时间倒序 fallback 注入（如 L2 recent 模式），输出 "recent"；
-    有值则格式化为 3 位小数（如 0.856）。
-    """
+    """向量相似度格式化。"""
     if score is None:
         return "recent"
     return f"{score:.3f}"
 
 
-class AgentMonitor:
-    """单轮对话的结构化控制台输出器。
+def _count_engineering_terms(text: str) -> int:
+    """统计 prompt 文本中出现的工程术语数量。"""
+    count = 0
+    for term in _ENGINEERING_TERMS:
+        if term in text:
+            count += 1
+    return count
 
-    核心方法：
-      configure()    初始化日志通道（静音第三方，仅 agent 输出）
-      banner()       分节标题（如 "--- 对话 -----------"）
-      startup()      服务启动信息
-      chat_user()    用户输入（每轮开始）
-      chat_memory()  记忆命中摘要（L0/L1/L2/L3/联想网络）
-      chat_reply()   助手回复与耗时
-      finish_turn()  轮次结束（先记忆再回复）
-      event()        后台异步事件（L1 压缩等）
-      warn()         非致命警告
+
+class _TurnTimer:
+    """计时上下文管理器 —— 由 AgentMonitor.turn_timer() 返回。"""
+
+    def __init__(self, monitor: "AgentMonitor", name: str) -> None:
+        self._monitor = monitor
+        self._name = name
+        self._start = 0.0
+
+    def __enter__(self) -> "_TurnTimer":
+        self._start = time.perf_counter()
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        elapsed = (time.perf_counter() - self._start) * 1000
+        self._monitor.set_timing(self._name, elapsed)
+
+
+class AgentMonitor:
+    """结构化的控制台输出器 —— 阶段 3.0 升级版。
+
+    新增方法：
+      start_turn()    — box-drawing 轮次头
+      identity()      — 身份信息行
+      memory_pack_v2() — MemoryPackV2 详细展开（debug）
+      prompt_summary() — prompt 安全摘要
+      consolidation() — Consolidator 结果展示
+      end_turn()      — 回复+耗时+box-drawing 尾
+      set_timing()    — 注入阶段耗时
+      turn_timer()    — 计时上下文管理器
+
+    旧方法保留兼容：
+      chat_user(), chat_memory(), chat_reply(), finish_turn()
     """
 
     def __init__(self) -> None:
         self._log = logging.getLogger(_AGENT_LOGGER)
         self._configured = False
+        self._turn_counter = 0
+        self._timings: dict[str, float] = {}
+        # SSE 日志缓冲（后台管理页面实时日志）
+        self._log_buffer: deque[str] = deque(maxlen=2000)
+
+    # ── 初始化 ──────────────────────────────────────────────────────
 
     def configure(self, *, force: bool = False) -> None:
-        """初始化日志配置：静音所有第三方库，仅 agent 通道输出 INFO。
-
-        只执行一次（通过 _configured 标志），多次调用安全。
-        传 force=True 可重建 handler（uvicorn --log-level 可能冲掉配置）。
-
-        静音策略（自底向上）：
-          1. root logger 设为 WARNING —— 所有未显式配置的 logger 默认静音
-          2. agent logger 的 handlers 清空重新绑定 —— 避免重复输出
-          3. 所有 _QUIET_LOGGERS 中的第三方/框架 logger 设为 WARNING
-          4. app 包下的 logger 也设为 WARNING —— agent 除外（保持 INFO）
-             agent logger 通过 propagate=False 独立输出，不进入 root 管道
-
-        最终效果：控制台 stdout 只输出 "agent" 通道的 INFO 消息，
-        所有其他日志（uvicorn、httpx、chromadb、openai 等）全部静音。
-        """
+        """初始化日志通道（静音第三方，仅 agent 输出）。"""
         if self._configured and not force:
             return
-        # Step 1: 清空 root logger 的所有 handler 并设为 WARNING
-        # 这样所有 logger 默认不会再输出 INFO/DEBUG 到控制台
+
         root = logging.getLogger()
         root.handlers.clear()
         root.setLevel(logging.WARNING)
 
-        # Step 2: 确保输出流使用 UTF-8 编码（Windows 终端可能默认 gbk）
         stream = sys.stdout
         if hasattr(stream, "reconfigure"):
             try:
@@ -121,13 +138,12 @@ class AgentMonitor:
             except Exception:
                 pass
 
-        # Step 3: 为 agent logger 创建独立的 handler，格式为纯消息（无时间戳/logger 名）
         handler = logging.StreamHandler(stream)
         handler.setFormatter(logging.Formatter("%(message)s"))
-        self._log.handlers.clear()  # 清空已有 handler，避免多次 configure 导致重复
+        self._log.handlers.clear()
         self._log.addHandler(handler)
         self._log.setLevel(logging.INFO)
-        self._log.propagate = False  # 关键：不向 root 传播，因为 root 已是 WARNING
+        self._log.propagate = False
 
         for name in _QUIET_LOGGERS:
             logging.getLogger(name).setLevel(logging.WARNING)
@@ -138,40 +154,407 @@ class AgentMonitor:
         self._configured = True
 
     def ensure_ready(self) -> None:
-        """Ensure agent logger still has a handler (uvicorn may reset logging)."""
+        """确保 agent logger handler 存在（uvicorn 可能冲掉配置）。"""
         if not self._log.handlers or not self._configured:
             self.configure(force=True)
 
     def _line(self, msg: str) -> None:
-        """写一行到 agent 日志通道（内部辅助方法）。"""
+        """写一行到 agent 日志通道。"""
         self.ensure_ready()
         self._log.info(msg)
+        # 同时写入 SSE 日志缓冲
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._log_buffer.append(f"[{ts}] {msg}")
+
+    def _mode_is(self, *levels: str) -> bool:
+        """检查当前日志模式是否匹配任一给定级别。"""
+        current = str(settings.console_log_mode)
+        return current in levels
+
+    # ── 公用方法（所有模式可用） ────────────────────────────────────
 
     def banner(self, title: str) -> None:
-        """打印分节标题线，如 "--- 对话 ------------------------------" """
+        """分节标题线（兼容旧代码）。"""
+        if self._mode_is("silent"):
+            return
         self._line(f"\n--- {title} " + "-" * max(0, 40 - len(title)))
 
     def startup(self, msg: str) -> None:
-        """服务启动信息（lifespan 阶段输出）。
-
-        包括：LLM/向量就绪状态、监听地址、语料同步进度等。
-        """
+        """服务启动信息（silent 模式也显示）。"""
         self._line(f"[启动] {msg}")
 
     def warn(self, msg: str) -> None:
-        """非致命警告（入库失败、配置缺失、API 错误等）。
-
-        这些不会导致服务崩溃，但需要开发者关注。
-        """
+        """非致命警告（silent 模式也显示）。"""
         self._line(f"[警告] {msg}")
 
-    def chat_user(self, device_id: str, message: str) -> None:
-        """轮次开始：打印用户输入消息。
+    def event(self, msg: str) -> None:
+        """后台异步事件。"""
+        if self._mode_is("silent"):
+            return
+        self._line(f"   * {msg}")
 
-        参数:
-            device_id: 设备标识（default 时不显示）
-            message:   用户发送的文本
+    # ── 轮次启动（阶段 3.0 核心） ──────────────────────────────────
+
+    def start_turn(self, device_id: str, message: str, session_id: str = "") -> None:
+        """打印 box-drawing 轮次头和用户消息。
+
+        在 agent.py 的 handle_chat/stream 入口调用。
         """
+        if self._mode_is("silent"):
+            return
+
+        self._turn_counter += 1
+        now_str = datetime.now().strftime("%H:%M:%S")
+        width = settings.console_log_width
+        dev = device_id if device_id != "default" else ""
+
+        session_suffix = ""
+        if self._mode_is("debug", "trace") and session_id:
+            session_suffix = f" · session={session_id[:12]}"
+
+        self._line(f"╭─ Turn #{self._turn_counter} · {now_str} · {dev}{session_suffix}")
+        self._line(f"│ 用户: {_clip(message, width - 10)}")
+
+    def set_timing(self, name: str, ms: float) -> None:
+        """注入阶段耗时。"""
+        self._timings[name] = ms
+
+    def turn_timer(self, name: str) -> _TurnTimer:
+        """返回一个计时上下文管理器。
+
+        用法：
+            with agent_monitor.turn_timer("llm"):
+                reply = await llm_call(...)
+        """
+        return _TurnTimer(self, name)
+
+    # ── 身份展示 ──────────────────────────────────────────────────
+
+    def identity(
+        self,
+        person_profile: dict | None,
+        memory: dict,
+        interlocutor_mode: str,
+    ) -> None:
+        """打印当前对话对象的身份信息。"""
+        if self._mode_is("silent"):
+            return
+
+        if self._mode_is("debug", "trace"):
+            # 多行详细
+            if person_profile:
+                from app.memory.profile import (
+                    normalize_profile,
+                    profile_display_name,
+                    profile_nicknames,
+                )
+                p = normalize_profile(person_profile)
+                nick = profile_display_name(p) or (
+                    profile_nicknames(p)[0] if profile_nicknames(p) else "?"
+                )
+                confirmed = str(p.get("confirmed", False)).lower()
+                guest = str(memory.get("guest_mode", False)).lower()
+                self._line(f"│ 身份:")
+                self._line(f"│   mode={interlocutor_mode} · person={nick} · confirmed={confirmed} · guest={guest}")
+            else:
+                self._line(f"│ 身份:")
+                self._line(f"│   mode={interlocutor_mode} · 未绑定画像")
+        else:
+            # 单行紧凑
+            if person_profile:
+                from app.memory.profile import (
+                    normalize_profile,
+                    profile_display_name,
+                    profile_nicknames,
+                )
+                p = normalize_profile(person_profile)
+                nick = profile_display_name(p) or (
+                    profile_nicknames(p)[0] if profile_nicknames(p) else "?"
+                )
+                confirmed_str = "已确认" if p.get("confirmed") else "待确认"
+                pid = str(p.get("person_id") or "")[:12]
+                self._line(
+                    f"│ 身份: {nick} · {interlocutor_mode} · {confirmed_str} · id={pid}"
+                )
+            elif memory.get("guest_mode"):
+                mem_pid = str(memory.get("person_id") or "—")[:16]
+                self._line(f"│ 身份: 访客 · tmp={mem_pid}…")
+            else:
+                self._line(f"│ 身份: {interlocutor_mode}")
+
+    # ── MemoryPack 摘要 ────────────────────────────────────────────
+
+    def memory_pack_v2(self, memory_pack: Any) -> None:
+        """打印 MemoryPackV2 详细内容（debug/trace 模式）。"""
+        if not self._mode_is("debug", "trace"):
+            return
+
+        # 尝试获取 MemoryPackV2
+        pack_v2 = None
+        if memory_pack is not None:
+            try:
+                pack_v2 = getattr(memory_pack, "_v2", None) or (
+                    memory_pack.to_v2() if hasattr(memory_pack, "to_v2") else None
+                )
+            except Exception:
+                pack_v2 = None
+
+        if pack_v2 is None:
+            self._line(f"│ MemoryPack: (unavailable)")
+            return
+
+        import app.memory.schema as _schema
+
+        # 月份查询标记
+        raw = getattr(pack_v2, "_raw", {}) or {}
+        mk = str(raw.get("month_key", "") or "")
+        if mk:
+            self._line(f"│ MemoryPackV2:")
+            self._line(f"│   month_key={mk}")
+        else:
+            self._line(f"│ MemoryPackV2:")
+
+        # L3 命中摘要（source / category / score）
+        l3_matches = (raw.get("matches") or {}).get("l3") or []
+        if l3_matches:
+            l3_lines: list[str] = []
+            for m in l3_matches[:6]:
+                src = str(m.get("source", "—"))[:24]
+                cat = str(m.get("category", "—"))[:16]
+                scr = f"{m.get('score', 0):.3f}" if m.get("score") is not None else "recent"
+                l3_lines.append(f"{src}|{cat}|{scr}")
+            self._line(f"│   l3_hits={' · '.join(l3_lines)}")
+
+        # 关系状态块
+        rel = pack_v2.relationship
+        mood_str = f"mood={rel.recent_mood or '—'}"
+        att_str = f"attitude={rel.recent_attitude or '—'}"
+        temp_str = f"temp={rel.relationship_temperature:.2f}"
+        self._line(f"│   relationship: {mood_str} · {att_str} · {temp_str}")
+
+        # 当前状态
+        topic_str = pack_v2.current_topic or "—"
+        self._line(f"│   current: topic={topic_str}")
+
+        # MemoryItem 统计
+        try:
+            items = pack_v2.items_for_prompt() or []
+        except Exception:
+            items = []
+        kind_counts: dict[str, int] = {}
+        for item in items:
+            k = item.kind.value if hasattr(item.kind, "value") else str(item.kind)
+            kind_counts[k] = kind_counts.get(k, 0) + 1
+
+        kind_summary = " · ".join(f"{k}={v}" for k, v in sorted(kind_counts.items()))
+        self._line(f"│   items={len(items)} · {kind_summary}" if kind_summary else f"│   items={len(items)}")
+
+        # 前 5 条项目
+        for item in items[:5]:
+            text = _clip(item.humanized_text, 80) or _clip(item.content, 80)
+            kind_val = item.kind.value if hasattr(item.kind, "value") else str(item.kind)
+            conf = f"{item.confidence:.2f}"
+            self._line(f"│   [{kind_val}/{conf}] {text}")
+
+    def memory_pack_summary(self, memory: dict, memory_pack: Any = None) -> None:
+        """打印单行记忆包摘要（normal 模式）。"""
+        if self._mode_is("silent", "debug", "trace"):
+            return
+
+        if memory.get("guest_mode"):
+            self._line(f"│ 记忆: 访客模式 · 仅 L1 上下文")
+            return
+
+        # 尝试从 MemoryPackV2 获取摘要
+        pack_v2 = None
+        if memory_pack is not None:
+            try:
+                pack_v2 = getattr(memory_pack, "_v2", None) or (
+                    memory_pack.to_v2() if hasattr(memory_pack, "to_v2") else None
+                )
+            except Exception:
+                pack_v2 = None
+
+        if pack_v2 and settings.console_log_memory_detail:
+            try:
+                items = pack_v2.items_for_prompt() or []
+            except Exception:
+                items = []
+            kind_counts: dict[str, int] = {}
+            for item in items:
+                k = item.kind.value if hasattr(item.kind, "value") else str(item.kind)
+                kind_counts[k] = kind_counts.get(k, 0) + 1
+            summary_parts = [f"记忆项={len(items)}"]
+            for k, v in sorted(kind_counts.items()):
+                summary_parts.append(f"{k}={v}")
+            self._line(f"│ 记忆包: {' · '.join(summary_parts)}")
+            return
+
+        # 降级到旧 dict 格式
+        matches = memory.get("matches") or {}
+        l2_n = len(matches.get("l2") or [])
+        l3_n = len(matches.get("l3") or [])
+        related_n = len(matches.get("related") or [])
+        miss = "是" if memory.get("memory_miss") else "否"
+        self._line(f"│ 记忆: L2={l2_n} L3={l3_n} 联想={related_n} 未命中={miss}")
+
+    # ── Prompt 安全摘要 ────────────────────────────────────────────
+
+    def prompt_summary(self, messages: list[dict]) -> None:
+        """打印 prompt 安全摘要。
+        debug/trace 模式或 console_log_prompt_preview=True 时显示。
+        """
+        if self._mode_is("silent"):
+            return
+        show_preview = settings.console_log_prompt_preview
+        if self._mode_is("normal") and not show_preview:
+            return
+
+        if not messages:
+            return
+
+        system_content = messages[0].get("content", "") if messages else ""
+        chars = len(system_content)
+        eng_count = _count_engineering_terms(system_content)
+        sections = system_content.count("## ")
+
+        # 检测是否为 V2 人类化格式（简单的启发式）
+        has_human_sections = "## 你和她的关系状态" in system_content
+        has_old_terms = eng_count > 0
+        fallback = "no" if (has_human_sections and not has_old_terms) else "yes" if has_old_terms else "no"
+
+        if self._mode_is("debug", "trace"):
+            self._line(f"│ Prompt:")
+            self._line(f"│   sections={sections} · chars={chars} · engineering_terms={eng_count} · fallback={fallback}")
+            if show_preview:
+                preview = system_content[:200].replace("\n", "\n│   ")
+                self._line(f"│   preview: {preview}…")
+        else:
+            self._line(f"│ Prompt: {sections}段 {chars}字 工程词={eng_count}")
+
+    # ── Consolidator 结果展示 ──────────────────────────────────────
+
+    def consolidation(self, result: Any) -> None:
+        """打印 Consolidator 处理详细结果（debug/trace 模式）。
+
+        必须在 end_turn 之前调用（因为输出在 box 内部）。
+        """
+        if not self._mode_is("debug", "trace"):
+            return
+        if not result:
+            return
+
+        self._line(f"│ Consolidator:")
+        if hasattr(result, "classification"):
+            self._line(f"│   classification={result.classification.reason}")
+
+        if hasattr(result, "quality_decision") and result.quality_decision:
+            self._line(f"│   quality={result.quality_decision}")
+
+        if hasattr(result, "contacts_updated") and result.contacts_updated:
+            self._line(f"│   contact=hit {result.contacts_updated} contacts")
+        elif getattr(result, "classification", None) and result.classification.is_third_party:
+            self._line(f"│   contact=query")
+
+        ol_created = len(result.open_loops_created) if hasattr(result, "open_loops_created") else 0
+        ol_resolved = len(result.open_loops_resolved) if hasattr(result, "open_loops_resolved") else 0
+        self._line(f"│   open_loop=new {ol_created} resolved {ol_resolved}")
+
+        if result.open_loops_created:
+            self._line(f"│   open_loop_titles={' '.join(result.open_loops_created)}")
+        if result.open_loops_resolved:
+            self._line(f"│   open_loop_resolved={' '.join(result.open_loops_resolved)}")
+
+        temp_before = result.relationship_before.get("relationship_temperature", "?") if hasattr(result, "relationship_before") else "?"
+        temp_after = result.relationship_after.get("relationship_temperature", "?") if hasattr(result, "relationship_after") else "?"
+        self._line(f"│   relationship=temp {temp_before}→{temp_after}")
+
+        if hasattr(result, "corrections_applied") and result.corrections_applied:
+            s = result.corrections_applied
+            self._line(f"│   correction=del_mem {s.get('deleted_facts',0)} del_chunk {s.get('deleted_chunks',0)}")
+
+        if hasattr(result, "emotional_events_detected") and result.emotional_events_detected:
+            self._line(f"│   emotional_events={' '.join(result.emotional_events_detected)}")
+
+    # ── 轮次收尾 ──────────────────────────────────────────────────
+
+    def end_turn(self, reply: str, t0: float, *, consolidation_result: Any = None) -> None:
+        """打印回复、耗时和 box-drawing 结尾。
+
+        Args:
+            reply:                LLM 回复文本
+            t0:                   轮次开始时间戳（time.perf_counter）
+            consolidation_result: 可选 ConsolidationResult，normal 模式显示紧凑后台行
+        """
+        if self._mode_is("silent"):
+            return
+
+        elapsed = (time.perf_counter() - t0) * 1000
+        width = settings.console_log_width
+
+        if self._mode_is("debug", "trace"):
+            self._line(f"│ 回复:")
+            self._line(f"│   {_clip(reply, width - 4)}")
+            if self._timings and settings.console_log_timing:
+                timing_items = [
+                    f"{k}={v:.0f}ms"
+                    for k, v in self._timings.items()
+                    if v is not None
+                ]
+                timing_str = " · ".join(timing_items)
+                self._line(f"│ Timings:")
+                self._line(f"│   {timing_str} total={elapsed:.0f}ms")
+            elif settings.console_log_timing:
+                self._line(f"│ Timings: total={elapsed:.0f}ms")
+            self._line("╰─ " + "─" * max(0, width - 4))
+        else:
+            # normal 模式
+            self._line(f"│ 回复: {_clip(reply, width - 14)}")
+            if settings.console_log_timing:
+                timing_parts: list[str] = []
+                if self._timings:
+                    timing_parts.extend(
+                        f"{k}={v:.0f}ms"
+                        for k, v in self._timings.items()
+                        if v is not None and k in ("recall", "llm", "prompt")
+                    )
+                timing_parts.append(f"total={elapsed:.0f}ms")
+                self._line(f"│ 耗时: {' '.join(timing_parts)}")
+
+            # 紧凑后台行（Consolidator 摘要）
+            if consolidation_result:
+                bg_events = self._compact_background_events(consolidation_result)
+                if bg_events:
+                    self._line(f"│ 后台: {' · '.join(bg_events)}")
+
+            self._line("╰─ " + "─" * max(0, width - 4))
+
+    @staticmethod
+    def _compact_background_events(result: Any) -> list[str]:
+        """从 ConsolidationResult 中提取紧凑后台事件摘要（normal 模式用）。"""
+        events: list[str] = []
+        if not result:
+            return events
+
+        if hasattr(result, "open_loops_created") and result.open_loops_created:
+            events.append(f"待跟进新增 · {' '.join(result.open_loops_created[:2])}")
+        if hasattr(result, "open_loops_resolved") and result.open_loops_resolved:
+            events.append(f"待跟进完成 · {' '.join(result.open_loops_resolved)}")
+        if hasattr(result, "contacts_updated") and result.contacts_updated:
+            events.append(f"第三方画像 · {result.contacts_updated}")
+        if hasattr(result, "emotional_events_detected") and result.emotional_events_detected:
+            events.append(f"情感事件 · {' '.join(result.emotional_events_detected)}")
+        if hasattr(result, "corrections_applied") and result.corrections_applied:
+            s = result.corrections_applied
+            events.append(f"记忆修正 · 删{s.get('deleted_facts',0)} 增{s.get('added_facts',0)}")
+        return events
+
+    # ── 旧方法兼容（仍可使用，但新代码推荐用上面的新方法） ──────────
+
+    def chat_user(self, device_id: str, message: str) -> None:
+        """旧版轮次入口（保持兼容）。"""
+        if self._mode_is("silent"):
+            return
         self.banner("对话")
         dev = device_id if device_id != "default" else ""
         prefix = f"[{dev}] " if dev else ""
@@ -185,14 +568,9 @@ class AgentMonitor:
         empty_msg: str,
         fmt_item,
     ) -> None:
-        """打印单层记忆命中列表的通用方法。
-
-        参数:
-            layer:     层名（"L2" / "L3" / "联想"）
-            items:     命中条目列表
-            empty_msg: 无命中时的提示文案
-            fmt_item:  单条格式函数，接收 dict 返回 str
-        """
+        """打印单层记忆命中列表（兼容旧代码）。"""
+        if self._mode_is("silent"):
+            return
         if not items:
             self._line(f"  {layer}  {empty_msg}")
             return
@@ -208,50 +586,27 @@ class AgentMonitor:
         person_profile: dict | None = None,
         promotion_eval=None,
     ) -> None:
-        """打印本轮记忆召回摘要（对话对象 + 各层命中详情）。
+        """旧版记忆摘要（保持兼容）。"""
+        if self._mode_is("silent"):
+            return
 
-        参数:
-            memory:         memory_router.recall() 的返回值，包含 L0/L1/L2/L3/匹配信息
-            query:          用户本轮输入（用于未命中时展示查询内容）
-            person_profile: 当前对话对象的画像（含 draft 转正状态）
-            promotion_eval: 可选，临时画像转正评估结果（由 profile_promotion 模块生成）
-
-        输出结构：
-          1. 对话对象：实名用户显示昵称/关系/是否确认，访客显示 tmp_* ID
-          2. 记忆摘要：L0 条数、L1 上下文条数、L2/L3 命中状态、联想条数、未命中标记
-          3. L2 命中明细：相似度 + 文本片段
-          4. L3 命中明细：相似度 + 来源 + 文本片段
-          5. 联想记忆明细：关系类型 + 强度 + 文本片段
-          6. 未命中警告（仅当 L2 和 L3 均无相关内容时）
-        """
         if person_profile:
-            # 实名用户：展示昵称、关系、确认状态
-            # 引用的 profile 工具函数负责从画像字典中提取可读的展示信息
             from app.memory.profile import (
                 normalize_profile,
                 profile_display_name,
                 profile_nicknames,
-                profile_relationship,
             )
-
             p = normalize_profile(person_profile)
             nick = profile_display_name(p) or (
                 profile_nicknames(p)[0] if profile_nicknames(p) else "?"
             )
-            rel = profile_relationship(p) or "—"
+            rel = getattr(p, "relationship", None) or p.get("relationship", "—")
             pid = str(p.get("person_id") or "")[:12]
             confirmed = "已确认" if p.get("confirmed") else "待确认"
-            self._line(
-                f"  对象  {nick}（{rel}）"
-                f"  {confirmed} id={pid}…"
-            )
+            self._line(f"  对象  {nick}（{rel}）  {confirmed} id={pid}…")
         elif memory.get("guest_mode"):
-            # 访客模式：未实名，不检索任何长期记忆
             mem_pid = memory.get("person_id") or "—"
-            self._line(
-                f"  对象  访客（仅 L1） tmp={str(mem_pid)[:16]}…"
-                "  未实名不检索 L0/L2/L3/画像"
-            )
+            self._line(f"  对象  访客（仅 L1） tmp={str(mem_pid)[:16]}…")
         else:
             mem_pid = memory.get("person_id")
             if mem_pid:
@@ -267,16 +622,9 @@ class AgentMonitor:
         l1_ctx = len(memory.get("working") or [])
 
         if memory.get("guest_mode"):
-            # 访客模式快速返回：仅展示 L1 条数，其余层均不检索
-            self._line(
-                f"  记忆  访客模式 · 仅 L1={l1_ctx}条"
-                "  L0/L2/L3/画像均不检索"
-            )
+            self._line(f"  记忆  访客模式 · 仅 L1={l1_ctx}条")
             return
 
-        # 已实名模式：逐层展示命中状态
-        # L0 和 L1 是全量注入的（不走检索），所以算条数而非"命中/未命中"
-        # L2/L3 走向量检索，用命中/未命中标记
         miss_tag = "须承认不清楚" if memory_miss else "—"
         self._line(
             f"  记忆  L0={l0_n}条(全量必载)"
@@ -303,7 +651,6 @@ class AgentMonitor:
                 f"{_clip(m.get('text', ''), 88)}"
             ),
         )
-
         related_items = matches.get("related") or []
         if related_items:
             self._print_match_layer(
@@ -315,31 +662,15 @@ class AgentMonitor:
                     f"{_clip(m.get('text', ''), 88)}"
                 ),
             )
-
         if memory_miss:
             self._line(f"  ⚠ L2/L3 均无相关内容，查询: {_clip(query, 48)}")
 
     def chat_reply(self, reply: str, elapsed_ms: float) -> None:
-        """打印助手回复与耗时。
-
-        参数:
-            reply:      生成的回复文本
-            elapsed_ms: 本轮处理耗时（毫秒）
-        """
+        """旧版回复+耗时（保持兼容）。"""
+        if self._mode_is("silent"):
+            return
         self._line(f"<< 回复 {reply}")
         self._line(f"   耗时 {elapsed_ms:.0f}ms")
-
-    def event(self, msg: str) -> None:
-        """后台异步事件日志。
-
-        用于记录不阻塞对话响应的后台操作，如：
-          - L1→L2 压缩完成
-          - L0 核心事实入库
-          - 记忆修正（用户纠错、冲突合并）
-          - 语料同步进度
-          - 空闲会话清理
-        """
-        self._line(f"   * {msg}")
 
     def finish_turn(
         self,
@@ -351,32 +682,23 @@ class AgentMonitor:
         person_profile: dict | None = None,
         promotion_eval=None,
     ) -> None:
-        """轮次结束：依次打印记忆命中摘要和回复与耗时。
-
-        参数:
-            memory:        记忆召回结果
-            query:         用户输入
-            reply:         LLM 生成的回复
-            t0:            time.perf_counter() 记录的轮次开始时间戳
-            person_profile: 对话对象画像
-            promotion_eval: 临时画像转正评估结果
-
-        输出顺序：先记忆摘要（chat_memory），再回复+耗时（chat_reply）。
-        这样设计是因为控制台阅读时记忆命中是"排查过程"，
-        回复是"结果"，从过程到结果自上而下自然。
-        """
-        # 先打印记忆召回详情（对话对象 + 各层命中）
+        """旧版轮次收尾（保持兼容）。"""
         self.chat_memory(
             memory, query, person_profile=person_profile, promotion_eval=promotion_eval
         )
-        # 再打印回复文本与耗时（elapsed = 当前时间 - t0）
         self.chat_reply(reply, (time.perf_counter() - t0) * 1000)
 
 
-# 全局单例：整个应用共享同一个 AgentMonitor 实例
-# 在 main.py 的 lifespan 中调用 agent_monitor.configure() 初始化日志通道
-# 之后所有模块（agent.py、main.py、ws_handler.py 等）通过 import 使用同一实例
-# 为什么是全局单例而非依赖注入：
-#   monitor 是横切关注点（cross-cutting），几乎所有模块都可能调用，
-#   通过 import 比通过构造函数传递更简洁，不会污染每个模块的接口
+# 全局单例
 agent_monitor = AgentMonitor()
+
+
+# ── SSE 日志 API ──────────────────────────────────────────────
+
+def sse_get_history(last_index: int = 0) -> tuple[list[str], int]:
+    """获取历史日志（从 last_index 位置开始），返回 (lines, new_index)。"""
+    buf = list(agent_monitor._log_buffer)
+    total = len(buf)
+    if last_index >= total:
+        return [], total
+    return buf[last_index:], total

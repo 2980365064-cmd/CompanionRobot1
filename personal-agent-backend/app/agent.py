@@ -31,7 +31,7 @@
                                    可选的主动话题（||| 分隔）
   7. _parse_reply                  解析 ||| 分隔符，校验主动话题合法性
   8. _append_turn                  用户/主回复/主动话题写入 L1
-  9. _post_process（后台异步）     L1 压缩、L0/Facts 捕获、记忆修正、
+  9. _post_process（后台异步）     核心记忆/长期记忆捕获、记忆修正、
                                    显式「记住」语料入库
                                    不阻塞本轮回复返回
 
@@ -59,10 +59,9 @@ from datetime import datetime, timezone
 
 from app.config import settings
 from app.llm import chat_completion_async, chat_completion_small_async, chat_completion_stream_async
-from app.memory.extractor import consolidate_session, extract_facts, maybe_compress_l1
+from app.memory.extractor import consolidate_session
 from app.memory.guard import (
     ANTI_HALLUCINATION_RULES,
-    capture_user_stated_facts,
     extract_self_name,
     memory_l3_texts,
     memory_miss_level,
@@ -74,13 +73,11 @@ from app.memory.guard import (
 )
 from app.memory.self_state import format_self_state_prompt
 from app.memory.l0 import (
-    capture_l0_from_user_message,
     extract_l0_from_session_summary,
     format_l0_block,
 )
 from app.memory.l1 import working_memory
-from app.memory.contacts import format_contacts_prompt_block, process_third_party_from_turn
-from app.memory.correction import try_apply_memory_corrections
+from app.memory.contacts import format_contacts_prompt_block
 from app.memory.identity import (
     is_guest_bind_failure_hint,
     is_verified_person_id,
@@ -97,7 +94,8 @@ from app.memory.profile import (
     format_profile_archive_query_block,
     profile_display_name,
 )
-from app.memory.router import memory_router
+from app.memory.orchestrator import orchestrator
+from app.memory.router import memory_router  # 保留旧 router 以备降级
 from app.persona.card import load_profile_card
 from app.monitor import agent_monitor
 from app.session import store
@@ -154,7 +152,7 @@ def _relative_time(iso_str: str | None, now: datetime | None = None) -> str:
 
 
 def _abs_time(iso_str: str | None) -> str:
-    """将 ISO 时间戳转成绝对时间字符串，用于 L2/L3 记忆块时效标注。
+    """将 ISO 时间戳转成绝对时间字符串，用于记忆块时效标注。
 
     返回示例："2026年6月7日 14:30"
     时区为 UTC，与 system prompt 中当前时间头保持一致。
@@ -196,61 +194,64 @@ def _l3_covers_name(name: str, memory: dict) -> bool:
     return False
 
 
+def _safe_memory_prompt_fallback() -> str:
+    """安全 fallback：当 MemoryPackV2.format_prompt_block() 异常时使用。
+
+    绝对不包含 L0/L2/L3/向量/检索/命中/记忆库 等工程词，
+    确保 LLM 在任何意外情况下也不会看到旧式工程术语结构。
+    """
+    return (
+        "## 你该记得的相关事\n"
+        "- 这轮记忆整理有点不完整，只按已确认事实自然回复，不要编。\n"
+        "- 不确定的地方要坦诚说不太记得，可以让对方提醒你。\n"
+    )
+
+
 def _format_l3_block(memory: dict) -> str:
-    """将 L3 向量检索命中结果格式化为 prompt 中的记忆块。
+    """将长程记忆命中结果格式化为 prompt 中的相关回忆块。
 
     参数:
         memory: memory_router.recall() 的返回值
 
     返回:
-        str: 格式化的 L3 记忆块文本，用于拼接到 system prompt
-
-    特殊情况：
-      - memory_miss=True：L2 和 L3 都未命中，返回反幻觉警告文本
-      - 无 l3 命中条目：返回"不太记得"提示
-      - 有命中：逐条格式化，每条带 [时效] [来源] 标签
+        str: 格式化的回忆块文本
     """
     if memory.get("memory_miss"):
         return (
-            "（L2/L3 均未检索到相关记忆 → 必须承认不清楚或请对方说明，"
-            "禁止编造任何人名、关系、经历、约定）"
+            "（你不记得相关的事 → 别编，诚实说不太清楚就好）"
         )
     items = (memory.get("matches") or {}).get("l3") or []
     if not items:
-        return "（已检索 L3，无相关匹配；须说「不太记得」）"
+        return "（没有找到相关的回忆；不太记得的话诚实说就好）"
     lines: list[str] = []
     for m in items:
-        tag = str(m.get("category") or m.get("source") or "memory").strip() or "memory"
         rel = _abs_time(m.get("created_at", ""))
-        time_label = f"[{rel}] " if rel else ""
-        lines.append(f"- {time_label}[{tag}] {m.get('text', '')}")
+        time_label = f"（{rel}的事）" if rel else ""
+        lines.append(f"- {time_label} {m.get('text', '')}")
     body = "\n".join(lines)
-    return body + "\n（只能复述以上条目中的事实，禁止补充未出现的细节）"
+    return body + "\n（只能说以上提到的内容，没提到的别瞎编）"
 
 
 def _format_related_block(memory: dict) -> str:
-    """将关联网络命中结果格式化为 prompt 中的联想记忆块。
-
-    关联网络存储的是记忆之间的语义关系（如"同一事件"、"因果关系"等），
-    strength >= 0.6 的关联才会注入 prompt（由 memory_relation_min_strength 控制）。
+    """将关联记忆结果格式化为 prompt 中的关联回忆块。
 
     参数:
         memory: memory_router.recall() 的返回值
 
     返回:
-        str: 格式化的联想记忆块，最多取前 6 条；无命中时返回空字符串
+        str: 格式化的关联回忆块，无命中时返回空字符串
     """
     related = (memory.get("matches") or {}).get("related") or []
     if not related:
         return ""
     lines = [
-        f"- [{r.get('relation_type', 'related')}·{r.get('strength', 0.5)}] {r.get('text', '')}"
+        f"- {r.get('text', '')}"
         for r in related[:6]
         if r.get("text")
     ]
     if not lines:
         return ""
-    return "## 联想记忆（关联网络 · strength≥0.6）\n" + "\n".join(lines) + "\n"
+    return "## 顺带想起的\n" + "\n".join(lines) + "\n"
 
 
 _GF_SCENE_EMOTION = re.compile(
@@ -303,57 +304,56 @@ def build_messages(
     *,
     device_id: str,
     person_profile: dict | None = None,
+    memory_pack: object = None,
 ) -> list[dict]:
     """核心函数：拼装完整的 LLM messages 列表（system + history + 当前用户消息）。
 
     参数:
         profile:        机器人人格描述文本（persona.md 内容）
-        memory:         memory_router.recall() 的返回值，
-                        包含 L0/L1/L2/L3/关联网络/身份提示等
+        memory:         记忆召回结果，含各层匹配数据和身份提示
         user_message:   用户本轮输入的文本
         device_id:      设备标识（用于特定逻辑如女友语气判断）
         person_profile: 当前对话对象的画像（可为 None，访客模式）
+        memory_pack:    可选的 MemoryPack 实例（提供后使用人类化 prompt 格式，
+                        替代工程分层术语）
 
     返回:
         list[dict]: OpenAI 格式的消息列表，可直接传给 chat_completion
 
     组装逻辑分两大分支：
 
-    --- 分支一：访客模式（guest_mode=True）---
-      仅注入 L1（本会话缓存），不访问任何长期记忆。
+    --- 分支一：访客模式 ---
+      仅使用本会话窗口，不访问长期记忆。
       system prompt 包含：
         - 机器人人格（profile）
-        - 反幻觉规则（ANTI_HALLUCINATION_RULES）
+        - 反幻觉规则
         - 身份提示（若检测到自我介绍）
         - 访客模式警告（禁止假装有记忆）
-        - 本会话缓存（L1 working block）
+        - 本会话缓存
         - 每轮顺带问一句"怎么称呼你呀"以推动实名（轮换问法，禁止复读）
 
     --- 分支二：已实名模式 ---
-      注入 L0（全量）+ L2（向量检索命中）+ L3（向量检索命中）+ 联想网络。
+      注入用户稳定记忆 + 近期会话摘要 + 相关回忆。
       system prompt 包含：
-        - L0 核心记忆块（优先级最高的事实）
         - 机器人人格
         - 反幻觉规则
+        - 关系状态 + 当前场景（由 MemoryPack 格式化）
         - 身份提示 + 人物块（provisional 或 archive）
-        - 情绪提示（基于近期对话的情感分析）
-        - 联想记忆块
-        - L2 近期会话摘要
-        - L3 长期记忆命中
-        - 记忆未命中警告（如适用）
+        - 情绪提示 + 自我状态
+        - 相关回忆（长期记忆命中）
         - 用户消息提示（检测到特定意图时注入额外指令）
         - 输出要求（叶鹏祥口吻、字数限制、女友语气等）
     """
     now = _now_utc()
-    # 格式化 L2 情景摘要（最近几天的对话压缩），带时间戳标注时效
+    # 格式化近期情景摘要（最近几天的对话压缩），带时间戳标注时效
     l2_matches_raw = (memory.get("matches") or {}).get("l2") or []
     if l2_matches_raw:
         episodic_block = "\n".join(
             f"- [{_abs_time(m.get('created_at', ''))}] {m.get('text', '')}"
             for m in l2_matches_raw
-        ) or "（无相关 L2 摘要）"
+        ) or "（最近暂时没有特别的事需要想起）"
     else:
-        episodic_block = "（无相关 L2 摘要）"
+        episodic_block = "（最近暂时没有特别的事需要想起）"
 
     # 提取用户声称的名字（如果本轮有自我介绍）
     claimed_name = ""
@@ -376,8 +376,8 @@ def build_messages(
             # L3 中有此人相关记忆，可以按记忆回应但仍然谨慎
             person_block = (
                 f"## 当前对话对象\n"
-                f"用户自称「{claimed_name}」；L3 长期记忆中有与此人相关的记录，"
-                f"可按 L3 内容自然回应，勿编造 L3 未写明的细节。"
+                f"用户自称「{claimed_name}」；你的长期记忆中有与此人相关的记录，"
+                f"可按已有记忆自然回应，没提到的不编。"
             )
         else:
             person_block = format_provisional_person_block(person_profile)
@@ -423,7 +423,7 @@ def build_messages(
 
         l3_block = _format_l3_block(memory)
         related_block = _format_related_block(memory)
-        episodic_block = "（无相关 L2 摘要）"
+        episodic_block = "（最近暂时没有特别的事需要想起）"
         l2_matches_raw = (memory.get("matches") or {}).get("l2") or []
         if l2_matches_raw:
             episodic_block = "\n".join(
@@ -445,13 +445,13 @@ def build_messages(
 - 叶鹏祥第一人称，友好自然，像跟朋友微信闲聊
 - 可参考下方记忆，但不要照搬对女友的语气
 
-## 本会话缓存（L1）
+## 本会话上下文
 {working_block}
 
-## 近期摘要（L2）
+## 最近聊过的
 {episodic_block}
 
-## 长期记忆（L3）
+## 相关回忆
 {l3_block}
 {related_block}
 
@@ -500,11 +500,11 @@ def build_messages(
 
 {ANTI_HALLUCINATION_RULES}
 {identity_section}
-## 访客模式（未实名 · 仅 L1）
-- **禁止**假装拥有 L0/L2/L3/画像记忆；不得编造对方身份、关系、经历
-- 仅依据下方 L1 会话缓存自然闲聊；person_id 是记忆唯一主键，仅名字无法绑定
+## 访客模式（未实名）
+- 你不记得这个人，也没有关于 ta 的记忆——不要假装认识
+- 仅依据下方的会话内容自然闲聊，不要编造对方的身份、关系或经历
 
-## 本会话缓存（L1）
+## 本会话内容
 {working_block}
 
 ## 本轮输出要求
@@ -534,7 +534,7 @@ def build_messages(
         person_profile.get("provisional") or person_profile.get("known_in_memory") is False
     ) and not l3_knows_claimed:
         l3_block += (
-            "\n（注意：当前对象仅本轮自称，与 L3 语料中的其他人名勿混为一谈）"
+            "\n（注意：该对象仅本轮自称，跟你记忆中的其他人名勿混为一谈）"
         )
 
     # 记忆未命中提示：按级别注入不同强度的提示
@@ -588,19 +588,27 @@ def build_messages(
     # 身份信息 → 情绪提示 → 联想记忆 → L2 摘要 → L3 长期记忆 →
     # 未命中警告 → 消息提示 → 输出要求
     # 顺序很重要：L0 在最前，输出要求（格式指令）在最后
-    system = f"""{l0_prefix}{profile}
+
+    # ── 人类化提示块（Phase 4 / 阶段 3.0 安全加固）───────────────────
+    if memory_pack is not None:
+        try:
+            main_memory_block = memory_pack.format_prompt_block()
+        except Exception as exc:
+            logger.warning("MemoryPack format_prompt_block failed: %s", exc)
+            agent_monitor.warn(f"MemoryPack prompt fallback: {exc}")
+            main_memory_block = _safe_memory_prompt_fallback()
+    else:
+        main_memory_block = _safe_memory_prompt_fallback()
+
+    system = f"""{profile}
 
 ## 当前时间
 现在是 {now.strftime('%Y年%m月%d日 %H:%M')}（UTC），请据此判断记忆时效，严禁把很久前的事当刚发生的。
 
 {ANTI_HALLUCINATION_RULES}
 {identity_section}{person_section}{contacts_block}{emotion_block}{self_state_block}
-{related_block}## 近期会话摘要（L2，7天内）
-{episodic_block}
-
-## L3 长期记忆（向量检索命中）
-{l3_block}
-{memory_miss_block}{hints_block}
+{main_memory_block}
+{hints_block}
 ## 本轮输出要求（必须执行）
 - 按 profile 与场景路由；第一人称口语，像微信语音转文字
 {scene_hint}- 禁止括号动作/客服腔；「你妈」绝对禁止
@@ -718,15 +726,16 @@ async def handle_chat(device_id: str, session_id: str, message: str) -> tuple[st
       Step 10: 异步入库（asyncio.create_task）
     """
     t0 = time.perf_counter()
-    agent_monitor.chat_user(device_id, message)
 
     # Step 1: 获取或创建会话
-    _t_start = time.perf_counter()
     session_id = await asyncio.to_thread(
         store.get_or_create_session, device_id, session_id or None
     )
     _t1 = time.perf_counter()
-    print(f"  [agent] session: {(_t1 - _t_start) * 1000:.0f}ms", flush=True)
+    agent_monitor.set_timing("session", (_t1 - t0) * 1000)
+
+    # 阶段 3.0：box-drawing 轮次头
+    agent_monitor.start_turn(device_id, message, session_id)
 
     # Step 2: 对话角色（默认女友，口令切换访客/女友）
     ictx = await asyncio.to_thread(
@@ -740,12 +749,13 @@ async def handle_chat(device_id: str, session_id: str, message: str) -> tuple[st
     identity_hint = ictx.hint
     identity_event = ictx.monitor_event
     _t2 = time.perf_counter()
-    print(f"  [agent] interlocutor: {(_t2 - _t1) * 1000:.0f}ms mode={ictx.interlocutor_mode}", flush=True)
+    agent_monitor.set_timing("identity", (_t2 - _t1) * 1000)
 
     # Step 3: 并行加载人格卡片和记忆召回
-    memory, profile = await asyncio.gather(
+    # 通过 orchestrator 获取 MemoryPack，兼容旧 dict 格式
+    memory_pack, profile = await asyncio.gather(
         asyncio.to_thread(
-            memory_router.recall,
+            orchestrator.recall,
             device_id,
             session_id,
             message,
@@ -753,26 +763,36 @@ async def handle_chat(device_id: str, session_id: str, message: str) -> tuple[st
         ),
         asyncio.to_thread(load_profile_card, ictx.interlocutor_mode, message),
     )
+    memory = memory_pack.to_legacy_dict()
     memory["identity_hint"] = identity_hint
     # recall() 已按 person_id 设置 guest_mode；勿用 interlocutor 的 False 覆盖（女友模式≠已实名）
     memory["interlocutor_mode"] = ictx.interlocutor_mode
     memory["person_id"] = person_id
     _t3 = time.perf_counter()
-    print(f"  [agent] recall: {(_t3 - _t2) * 1000:.0f}ms", flush=True)
+    agent_monitor.set_timing("recall", (_t3 - _t2) * 1000)
+
+    # 身份展示
+    agent_monitor.identity(person_profile, memory, ictx.interlocutor_mode)
 
     if identity_event:
         agent_monitor.event(identity_event)
     elif identity_hint:
         agent_monitor.event(identity_hint[:48])
 
+    # MemoryPack 摘要
+    agent_monitor.memory_pack_v2(memory_pack)
+    agent_monitor.memory_pack_summary(memory, memory_pack)
+
     # Step 4: 拼装 prompt
     # 记忆未命中不再是硬阻断——LLM 带着 persona 自然回应，
     # build_messages 会根据 memory_miss_level 注入不同强度的提示
     messages = build_messages(
-        profile, memory, message, device_id=device_id, person_profile=person_profile
+        profile, memory, message, device_id=device_id, person_profile=person_profile,
+        memory_pack=memory_pack,
     )
     _t4 = time.perf_counter()
-    print(f"  [agent] prompt: {(_t4 - _t3) * 1000:.0f}ms", flush=True)
+    agent_monitor.set_timing("prompt", (_t4 - _t3) * 1000)
+    agent_monitor.prompt_summary(messages)
 
     temp = settings.chat_temperature
     if user_message_hints(message, memory=memory, person_profile=person_profile, device_id=device_id):
@@ -782,7 +802,7 @@ async def handle_chat(device_id: str, session_id: str, message: str) -> tuple[st
     reply_raw = await chat_completion_async(messages, temperature=temp)
     reply_raw = reply_raw.strip()
     _t5 = time.perf_counter()
-    print(f"  [agent] llm: {(_t5 - _t4) * 1000:.0f}ms", flush=True)
+    agent_monitor.set_timing("llm", (_t5 - _t4) * 1000)
 
     # Step 6: 解析 ||| 分隔符，拆分主回复和主动话题
     reply, active_topic = _parse_reply(reply_raw)
@@ -809,25 +829,10 @@ async def handle_chat(device_id: str, session_id: str, message: str) -> tuple[st
             working_memory.append, session_id, "assistant", active_topic
         )
 
-    # Step 9: 控制台输出
-    try:
-        agent_monitor.finish_turn(
-            memory,
-            message,
-            reply,
-            t0,
-            person_profile=person_profile,
-            promotion_eval=None,
-        )
-    except Exception as exc:
-        logger.warning("monitor finish_turn failed: %s", exc)
-
-    _t_total = time.perf_counter()
-    print(
-        f"  [agent] total: {(_t_total - t0) * 1000:.0f}ms "
-        f"| reply_chars={len(reply)} topic={'Y' if active_topic else 'N'}",
-        flush=True,
-    )
+    # Step 9: 控制台输出（阶段 3.0）
+    # end_turn 输出回复、耗时和 box-drawing 结尾
+    # 后台事件（Consolidator 结果）由 _post_process 中的 agent_monitor.event() 展示
+    agent_monitor.end_turn(reply, t0)
 
     # Step 10: 后台异步入库
     asyncio.create_task(
@@ -856,14 +861,14 @@ async def handle_chat_stream(device_id: str, session_id: str, message: str):
                 finalize(data)
     """
     t0 = time.perf_counter()
-    agent_monitor.chat_user(device_id, message)
 
-    _t_start = time.perf_counter()
     session_id = await asyncio.to_thread(
         store.get_or_create_session, device_id, session_id or None
     )
     _t1 = time.perf_counter()
-    print(f"  [agent] session: {(_t1 - _t_start) * 1000:.0f}ms", flush=True)
+    agent_monitor.set_timing("session", (_t1 - t0) * 1000)
+
+    agent_monitor.start_turn(device_id, message, session_id)
 
     ictx = await asyncio.to_thread(
         resolve_interlocutor_before_memory, device_id, session_id, message,
@@ -873,30 +878,38 @@ async def handle_chat_stream(device_id: str, session_id: str, message: str):
     identity_hint = ictx.hint
     identity_event = ictx.monitor_event
     _t2 = time.perf_counter()
-    print(f"  [agent] interlocutor: {(_t2 - _t1) * 1000:.0f}ms mode={ictx.interlocutor_mode}", flush=True)
+    agent_monitor.set_timing("identity", (_t2 - _t1) * 1000)
 
-    memory, profile = await asyncio.gather(
+    memory_pack, profile = await asyncio.gather(
         asyncio.to_thread(
-            memory_router.recall, device_id, session_id, message, person_id=person_id,
+            orchestrator.recall, device_id, session_id, message, person_id=person_id,
         ),
         asyncio.to_thread(load_profile_card, ictx.interlocutor_mode, message),
     )
+    memory = memory_pack.to_legacy_dict()
     memory["identity_hint"] = identity_hint
     memory["interlocutor_mode"] = ictx.interlocutor_mode
     memory["person_id"] = person_id
     _t3 = time.perf_counter()
-    print(f"  [agent] recall: {(_t3 - _t2) * 1000:.0f}ms", flush=True)
+    agent_monitor.set_timing("recall", (_t3 - _t2) * 1000)
+
+    agent_monitor.identity(person_profile, memory, ictx.interlocutor_mode)
 
     if identity_event:
         agent_monitor.event(identity_event)
     elif identity_hint:
         agent_monitor.event(identity_hint[:48])
 
+    agent_monitor.memory_pack_v2(memory_pack)
+    agent_monitor.memory_pack_summary(memory, memory_pack)
+
     messages = build_messages(
-        profile, memory, message, device_id=device_id, person_profile=person_profile
+        profile, memory, message, device_id=device_id, person_profile=person_profile,
+        memory_pack=memory_pack,
     )
     _t4 = time.perf_counter()
-    print(f"  [agent] prompt: {(_t4 - _t3) * 1000:.0f}ms", flush=True)
+    agent_monitor.set_timing("prompt", (_t4 - _t3) * 1000)
+    agent_monitor.prompt_summary(messages)
 
     temp = settings.chat_temperature
     if user_message_hints(message, memory=memory, person_profile=person_profile, device_id=device_id):
@@ -917,7 +930,7 @@ async def handle_chat_stream(device_id: str, session_id: str, message: str):
         reply_parts.append(err_msg)
         yield ("token", err_msg)
     _t5 = time.perf_counter()
-    print(f"  [agent] llm: {(_t5 - _t4) * 1000:.0f}ms", flush=True)
+    agent_monitor.set_timing("llm", (_t5 - _t4) * 1000)
 
     reply_raw = "".join(reply_parts).strip()
     reply, active_topic = _parse_reply(reply_raw)
@@ -939,20 +952,7 @@ async def handle_chat_stream(device_id: str, session_id: str, message: str):
             working_memory.append, session_id, "assistant", active_topic
         )
 
-    try:
-        agent_monitor.finish_turn(
-            memory, message, reply, t0,
-            person_profile=person_profile, promotion_eval=None,
-        )
-    except Exception as exc:
-        logger.warning("monitor finish_turn failed: %s", exc)
-
-    _t_total = time.perf_counter()
-    print(
-        f"  [agent] total: {(_t_total - t0) * 1000:.0f}ms "
-        f"| reply_chars={len(reply)} topic={'Y' if active_topic else 'N'}",
-        flush=True,
-    )
+    agent_monitor.end_turn(reply, t0)
 
     asyncio.create_task(
         _post_process(device_id, session_id, message, reply, memory, person_id)
@@ -1146,99 +1146,69 @@ async def _post_process(
     memory: dict,
     person_id: str | None,
 ) -> None:
-    """后台处理：L1→L2 压缩、L0/Facts 捕获、用户纠错、显式「记住」入库。
+    """后台处理：统一裁决本轮记忆沉淀。
 
-    所有操作都是 fire-and-forget 模式，失败仅记录日志不影响用户体验。
+    委托 MemoryConsolidator 完成统一分类与路由，避免 6 个写入操作
+    各自独立裁决。所有操作 fire-and-forget，失败仅记录日志。
 
-    执行顺序经过设计：
-      先压缩 L1→L2（减少后续处理需要扫描的原始消息量），
-      再提取 L0/Facts（此时压缩已完成，可避免冗余提取），
-      接着做记忆修正（用户纠错比自动提取优先级更高），
-      最后做自动 Facts 提取（填充剩余的结构化事实）。
-
-    具体步骤：
-      1. L1→L2 压缩：当 L1 积累超过配置阈值时，通过 LLM 压缩为 L2 情景摘要
-      2. L0 捕获：从用户消息中提取高置信度核心事实（如"我住在北京"）
-      3. Facts 捕获：用户明确宣称的事实（如"我叫张三"）
-      4. 记忆修正：用户说"不对/记错了/不是"时，LLM 判断并修正错误记忆
-      5. 自动 Facts 提取：从对话中语义抽取结构化事实
+    写入路径（按优先级）：
+      1. 纠错 → 修正旧记忆
+      2. 压缩 L1→L2 → 持久化情景摘要
+      3. 事实捕获 → 核心记忆 + 长期记忆
+      4. 第三方人物 → Contact Profile
     """
-    # ---- L1→L2 压缩 ----
-    # 仅对实名用户执行，访客的 L1 在 session_end 时直接丢弃
-    # 设计意图：压缩需要 LLM 调用，有成本；访客的临时对话不值得持久化
+    # ---- 统一裁决：委托 MemoryConsolidator ----
+    # 所有写入决策集中在 consolidator，避免各模块各自判断
     try:
-        if is_verified_person_id(person_id):
-            compressed = await asyncio.to_thread(
-                maybe_compress_l1, device_id, session_id, person_id or ""
-            )
-            if compressed:
-                agent_monitor.event("L1→L2 会话已压缩入库")
-    except Exception as exc:
-        agent_monitor.warn(f"L1 压缩失败: {exc}")
+        from app.memory.consolidator import consolidator
 
-    # ---- L0 核心事实捕获 ----
-    # 从用户本轮消息中提取高置信度声明（如"我今年30岁"→L0 preference）
-    try:
-        if is_verified_person_id(person_id):
-            l0_saved = await asyncio.to_thread(
-                capture_l0_from_user_message, device_id, person_id, user_msg
-            )
-            if l0_saved:
-                agent_monitor.event(f"L0 入库 · {len(l0_saved)} 条")
-            await asyncio.to_thread(
-                capture_user_stated_facts, device_id, person_id, session_id, user_msg
-            )
-    except Exception as exc:
-        logger.warning("capture user facts failed: %s", exc)
+        # 将 profile 附着在 memory 上供 contacts 使用
+        if person_id and "contacts" not in memory:
+            try:
+                memory["_person_profile"] = store.get_person_profile(person_id or "")
+            except Exception:
+                pass
 
-    # ---- 记忆修正 ----
-    # 当用户消息包含纠错意图（"不对"、"你记错了"、"不是这样的"等），
-    # LLM 分析用户本轮消息与 memory 中的矛盾，自动更正 L3 块和 L0 记录
-    try:
-        if is_verified_person_id(person_id):
-            result = await asyncio.to_thread(
-                try_apply_memory_corrections,
-                device_id,
-                person_id or "",
-                session_id,
-                user_msg,
-                assistant_msg,
-                memory,
-            )
-            if result:
-                s = result.get("stats") or {}
-                agent_monitor.event(
-                    f"记忆修正 · {result.get('reason', '')[:40]} "
-                    f"删事实{s.get('deleted_facts', 0)} 删块{s.get('deleted_chunks', 0)} "
-                    f"改块{s.get('patched_chunks', 0)} 新增{s.get('added_facts', 0)} "
-                    f"删L0{s.get('deleted_l0', 0)}"
-                )
-    except Exception as exc:
-        logger.warning("memory correction failed: %s", exc)
+        result = await consolidator.process_turn_async(
+            device_id, session_id,
+            user_msg, assistant_msg,
+            memory, person_id,
+        )
 
-    # ---- 第三方人物画像 ----
-    try:
-        if is_verified_person_id(person_id):
-            events = await asyncio.to_thread(
-                process_third_party_from_turn,
-                device_id,
-                person_id or "",
-                user_msg,
-                assistant_msg,
-                owner_profile=store.get_person_profile(person_id or ""),
-            )
-            for ev in events:
-                agent_monitor.event(ev)
-    except Exception as exc:
-        logger.warning("third-party contact profile failed: %s", exc)
+        # 控制台输出写入摘要
+        if result.skipped:
+            return
 
-    # ---- 自动 Facts 提取 ----
-    # 从本轮对话中通过轻量 LLM 提取结构化事实，写入 L3 Facts 集合
-    if is_verified_person_id(person_id):
-        try:
-            await asyncio.to_thread(extract_facts, device_id, session_id, user_msg, assistant_msg)
-        except Exception:
-            pass
+        events: list[str] = []
+        if result.did_compress_l1:
+            events.append("L1→L2 会话已压缩入库")
+        if result.l0_saved_count:
+            events.append(f"L0 入库 · {result.l0_saved_count} 条")
+        if result.corrections_applied:
+            s = result.corrections_applied
+            events.append(
+                f"记忆修正 · 删事实{s.get('deleted_facts', 0)} "
+                f"删块{s.get('deleted_chunks', 0)} "
+                f"改块{s.get('patched_chunks', 0)} "
+                f"新增{s.get('added_facts', 0)} "
+                f"删L0{s.get('deleted_l0', 0)}"
+            )
+        if result.contacts_updated:
+            events.append(f"第三方画像更新 · {result.contacts_updated} 个")
+        if result.open_loops_created:
+            events.append(f"待跟进新增 · {' '.join(result.open_loops_created[:2])}")
+        if result.open_loops_resolved:
+            events.append(f"待跟进完成 · {' '.join(result.open_loops_resolved)}")
+        if result.emotional_events_detected:
+            events.append(f"情感事件 · {' '.join(result.emotional_events_detected)}")
+        if result.errors:
+            for err in result.errors[:2]:
+                agent_monitor.warn(err)
+
+        for ev in events:
+            agent_monitor.event(ev)
+    except Exception as exc:
+        logger.warning("Consolidator process failed: %s", exc)
 
 
 # ============================

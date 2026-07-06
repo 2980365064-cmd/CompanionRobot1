@@ -35,6 +35,7 @@ from app.memory.l3 import (
     clear_persona_derived_memory,
     semantic_memory,
 )
+from app.memory.person_resolver import invalidate_wiki_cache, sync_wiki_people_to_contacts
 
 logger = logging.getLogger(__name__)
 
@@ -493,10 +494,24 @@ def ingest_directory(
             # 可选：从语料块中提取结构化事实，用于关系网络构建
             fact_stats = batch_extract_facts_from_persona_chunks(chunks)
 
+    # Wiki 人物页同步到 contact：入库后，将 persona/corpus/people/*.md 的人物生成为第三方画像
+    wiki_synced = 0
+    try:
+        sync_results = sync_wiki_people_to_contacts()
+        invalidate_wiki_cache()
+        synced = [r for r in sync_results if r["action"] in ("新建", "已存在，补全")]
+        wiki_synced = len(synced)
+        if synced:
+            log_detail = "; ".join(f'{r["name"]}({r["action"]})' for r in synced[:5])
+            logger.info("wiki->contact sync: %d synced (%s)", wiki_synced, log_detail)
+    except Exception as exc:
+        logger.warning("wiki->contact sync failed: %s", exc)
+
     return {
         "files": ingested,
         "corpus_chunks": len(chunks),
         "fact_stats": fact_stats,
+        "wiki_synced": wiki_synced,
     }
 
 
@@ -522,12 +537,21 @@ def startup_ingest_corpus() -> dict:
     reset = bool(getattr(settings, "persona_ingest_reset_on_startup", False))
     # 已有语料且不需要重置时跳过，避免启动变慢
     if existing > 0 and not reset:
+        # 尽管 L3 已存在，每次启动仍同步 Wiki 人物页到 contact（处理新增人物页）
+        wiki_synced = 0
+        try:
+            sync_results = sync_wiki_people_to_contacts()
+            invalidate_wiki_cache()
+            wiki_synced = len([r for r in sync_results if r["action"] in ("新建", "已存在，补全")])
+        except Exception as exc:
+            logger.warning("wiki->contact sync failed: %s", exc)
         return {
             "skipped": True,
             "reason": "corpus_exists",
             "corpus_chunks": existing,
             "files": [],
             "fact_stats": {"chunks": 0, "facts": 0, "skipped": 0},
+            "wiki_synced": wiki_synced,
         }
 
     cleared: dict = {}
