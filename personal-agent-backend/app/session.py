@@ -1,21 +1,29 @@
-"""SQLite 持久层 —— 会话、记忆、画像、关联图的统一存储。
+"""SQLite 持久层 —— 会话、统一记忆库（memory_items）、画像、关联图、状态寄存器的统一存储。
 
-本模块是陪伴机器人所有数据的持久化入口，通过 SessionStore 类封装全部
-数据库操作。使用 SQLite（单文件，零配置，适合单机部署）作为存储引擎。
+本模块是陪伴机器人所有数据的持久化入口。记忆系统已统一为三层抽象：
+  - Working Context（工作上下文：当前会话消息）
+  - Unified Memory Store（统一记忆库：所有长期/中期记忆通过 memory_items 统一表管理）
+  - State Registers（状态寄存器：画像、关联图、关系状态、Open Loops）
+
+记忆系统统一为三层抽象：
+  - Working Context（工作上下文：当前会话消息）
+  - Unified Memory Store（统一记忆库：所有长期/中期记忆通过 memory_items 统一表管理）
+  - State Registers（状态寄存器：画像、关联图、关系状态、Open Loops）
+
+旧四层记忆架构（核心事实/工作上下文/近期记忆/长期记忆）已整体迁移到 memory_items，旧表已物理删除。
 
 ============================
 数据表总览
 ============================
 
   sessions              会话表（device_id + session_id + active_person_id）
-  messages              消息表（L1 工作记忆：role + content）
-  episodic_memories     情景记忆表（会话摘要 + 话题 + 未决事项 + 情绪）
-  l3_chunks             向量块表（长期记忆 + 语料知识）
-  l3_chunks_fts         L3 全文索引（FTS5 虚拟表）
-  l0_core_memories      L0 核心记忆表（高置信核心事实）
-  l3_recall_stats       L3 召回统计表（追踪高频召回用于 L0 升级）
+  messages              消息表（工作上下文：role + content）
+  memory_items          统一记忆库表（全部长期/中期/核心记忆）
+  memory_items_fts      统一记忆库全文索引（FTS5）
   person_profiles       人物画像表（JSON 格式存储完整 Profile Card）
   memory_relations      记忆关联图表（from_id ↔ to_id 语义关系）
+  open_loops            待跟进事项表（结构化 Open Loop）
+  relationship_states   关系状态表（温度/情绪/态度）
 
 ============================
 关键设计
@@ -60,14 +68,14 @@ def _utc_now() -> str:
 
 
 def _expires_at(days: int | None = None) -> str:
-    """计算过期时间（默认使用配置的 L2 保留天数）。
+    """计算过期时间（默认使用配置的近期记忆保留天数）。
 
     参数:
-        days: 保留天数，None 时使用 settings.l2_retention_days
+        days: 保留天数，None 时使用 settings.recent_memory_retention_days
     返回:
         ISO 格式的过期时间字符串（UTC）
     """
-    d = days if days is not None else settings.l2_retention_days
+    d = days if days is not None else settings.recent_memory_retention_days
     return (datetime.now(timezone.utc) + timedelta(days=d)).isoformat()
 
 
@@ -92,7 +100,27 @@ def _decode_text_cell(value: object, *, column: str, rowid: int | None = None) -
 # ============================
 
 class SessionStore:
-    """SQLite 持久层：管理会话、消息、L0/L2/L3、Facts、画像、关联图。
+    """SQLite 持久层：会话上下文 + 统一记忆库 + 状态寄存器的统一存储。
+
+    本类对外提供三类语义接口：
+
+    1. Working Context（工作上下文）
+       append_message / list_recent_messages / compact_working_context / finalize_session
+
+    2. Unified Memory（统一记忆库）
+       write_memory_item / upsert_memory_item / list_memory_items
+       search_memory_items / count_memory_items / get_memory_item
+       archive_memory_item / delete_memory_item
+
+       语义视图（均基于 memory_items 统一表）：
+         list_core_facts          — 核心事实（visibility=always）
+         search_recent_memory     — 近期记忆（episode/emotion 类）
+         search_long_term_memory  — 长期记忆（fact/entity/wiki/relationship 类）
+
+    3. State Registers（状态寄存器）
+       get_or_create_session / save_person_profile / get_person_profile
+       upsert_memory_relation / get_memory_relations / save_relationship_state
+       create_open_loop / resolve_open_loop / list_open_loops
 
     所有公开方法都是同步的（SQLite 本身不支持异步），
     调用方应通过 asyncio.to_thread 在后台线程中执行以避免阻塞事件循环。
@@ -189,77 +217,84 @@ class SessionStore:
             "CREATE INDEX IF NOT EXISTS idx_open_loops_status ON open_loops(person_id, status)"
         )
 
-    def _migrate_episodic(self, conn: sqlite3.Connection) -> None:
-        """迁移 episodic_memories 表，添加新字段。
+    def _migrate_memory_items(self, conn: sqlite3.Connection) -> None:
+        """创建 memory_items 统一记忆表及 FTS5 全文索引。
 
-        episodic_memories 表初始版本只有基本字段，
-        后续迭代添加了 open_loops（未决事项）、expires_at（过期时间）、
-        archived（归档标记）、emotion（情绪标签）。
-        本方法检测这些列是否存在，不存在则 ALTER TABLE 添加。
+        memory_items 是统一的记忆存储层，替代旧的 核心事实/近期记忆/长期记忆 多表架构。
+        所有记忆类型（核心事实、近期记忆、长期记忆）统一存入此表。
         """
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(episodic_memories)")}
-        if not cols:
-            return  # 表不存在，无需迁移
-        if "open_loops" not in cols:
-            conn.execute("ALTER TABLE episodic_memories ADD COLUMN open_loops TEXT")
-        if "expires_at" not in cols:
-            conn.execute("ALTER TABLE episodic_memories ADD COLUMN expires_at TEXT")
-        if "archived" not in cols:
-            conn.execute("ALTER TABLE episodic_memories ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
-        if "emotion" not in cols:
-            conn.execute("ALTER TABLE episodic_memories ADD COLUMN emotion TEXT")
-        if "importance" not in cols:
-            conn.execute("ALTER TABLE episodic_memories ADD COLUMN importance INTEGER NOT NULL DEFAULT 3")
-        if "people" not in cols:
-            conn.execute("ALTER TABLE episodic_memories ADD COLUMN people TEXT DEFAULT '[]'")
-        if "status" not in cols:
-            conn.execute("ALTER TABLE episodic_memories ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
-        # 补充现有的空 expires_at
         conn.execute(
-            "UPDATE episodic_memories SET expires_at=? WHERE expires_at IS NULL OR expires_at=''",
-            (_expires_at(),),
+            """
+            CREATE TABLE IF NOT EXISTS memory_items (
+                id TEXT PRIMARY KEY,
+                person_id TEXT NOT NULL,
+                device_id TEXT NOT NULL DEFAULT '',
+                kind TEXT NOT NULL,
+                source TEXT NOT NULL,
+                visibility TEXT NOT NULL,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 1.0,
+                emotional_weight INTEGER NOT NULL DEFAULT 3,
+                recency_weight INTEGER NOT NULL DEFAULT 3,
+                context_json TEXT NOT NULL DEFAULT '{}',
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                embedding_json TEXT NOT NULL DEFAULT '[]',
+                source_table TEXT NOT NULL DEFAULT '',
+                source_id TEXT NOT NULL DEFAULT '',
+                source_session TEXT NOT NULL DEFAULT '',
+                expires_at TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                deleted_at TEXT NOT NULL DEFAULT ''
+            )
+            """
         )
+        try:
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS memory_items_fts USING fts5(
+                    id UNINDEXED,
+                    content_fts,
+                    tokenize='unicode61'
+                )
+                """
+            )
+        except Exception as exc:
+            logger.warning("memory_items_fts creation failed (non-fatal): %s", exc)
 
     def _ensure_indexes(self, conn: sqlite3.Connection) -> None:
         """创建所有必要的索引以优化查询性能。
 
         索引策略：
-          - messages: 按 session_id 查询（每轮都要拉 L1 历史）
-          - episodic: 按 device_id + person_id 查询、按 person_id + expires_at 查询
-          - facts: 按 person_id 查询
-          - l3: 按 collection + device_id + person_id 查询
+          - messages: 按 session_id 查询
           - profiles: 按 device_id 查询
-          - l0: 按 person_id + category 查询
-          - recall: 按 person_id + recall_count 排序
           - relations: 按 from_id / to_id 双向查
+          - memory_items: 按 source_table+source_id、person_id+kind+visibility 等
         """
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_episodic_device ON episodic_memories(device_id)")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_episodic_person ON episodic_memories(device_id, person_id)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_episodic_expires ON episodic_memories(device_id, expires_at)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_episodic_person_expires "
-            "ON episodic_memories(person_id, expires_at)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_l3_person ON l3_chunks(collection, device_id, person_id)"
-        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_person_profiles_device ON person_profiles(device_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_l3_collection ON l3_chunks(collection, device_id)")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_l0_person ON l0_core_memories(person_id, category)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_l3_recall_person ON l3_recall_stats(person_id, recall_count)"
-        )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_rel_from ON memory_relations(from_id)"
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rel_to ON memory_relations(to_id)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_items_source"
+            " ON memory_items(source_table, source_id)"
+            " WHERE source_table != '' AND source_id != ''"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_items_person_kind"
+            " ON memory_items(person_id, kind, visibility)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_items_person_updated"
+            " ON memory_items(person_id, updated_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_items_hash"
+            " ON memory_items(person_id, kind, content_hash)"
+        )
 
     def _migrate_memory_relations(self, conn: sqlite3.Connection) -> None:
         """创建 memory_relations 表（记忆关联图）。
@@ -307,82 +342,11 @@ class SessionStore:
                 "ALTER TABLE sessions ADD COLUMN interlocutor_mode TEXT NOT NULL DEFAULT 'girlfriend'"
             )
 
-    def _migrate_person_scope(self, conn: sqlite3.Connection) -> None:
-        """为记忆表添加 person_id 字段以支持多用户隔离。
-
-        早期版本只用 device_id 区分用户，一个设备可能有多人使用。
-        引入 person_id 后，可以通过"名字+ID"精确绑定用户，
-        一个人的记忆跨设备共享。
-        """
-        epi_cols = {row[1] for row in conn.execute("PRAGMA table_info(episodic_memories)")}
-        if epi_cols and "person_id" not in epi_cols:
-            conn.execute(
-                "ALTER TABLE episodic_memories ADD COLUMN person_id TEXT NOT NULL DEFAULT ''"
-            )
-        l3_cols = {row[1] for row in conn.execute("PRAGMA table_info(l3_chunks)")}
-        if l3_cols and "person_id" not in l3_cols:
-            conn.execute("ALTER TABLE l3_chunks ADD COLUMN person_id TEXT NOT NULL DEFAULT ''")
-        self._migrate_l0(conn)
-
-    def _migrate_l0(self, conn: sqlite3.Connection) -> None:
-        """创建 L0 核心记忆表和 L3 召回统计表。
-
-        L0（l0_core_memories）：
-          存储最高置信度的核心事实，每轮全量注入 prompt。
-          按 person_id + category + content_hash 去重。
-          分类：identity（身份）, taboo（忌讳）, key_people（关键人物）,
-                milestone（里程碑）, preference（偏好）
-
-        L3 召回统计（l3_recall_stats）：
-          追踪 L3 中每条事实被召回的次数。
-          当某事实的 recall_count >= l0_batch_min_recall
-          且 confidence >= l0_batch_min_confidence 时，
-          可被提升为 L0。
-        """
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS l0_core_memories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                person_id TEXT NOT NULL,
-                device_id TEXT NOT NULL DEFAULT '',
-                category TEXT NOT NULL,
-                content TEXT NOT NULL,
-                content_hash TEXT NOT NULL,
-                source TEXT NOT NULL DEFAULT 'user_declared',
-                confidence REAL NOT NULL DEFAULT 1.0,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_l0_person_hash
-            ON l0_core_memories(person_id, category, content_hash)
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS l3_recall_stats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                person_id TEXT NOT NULL,
-                content TEXT NOT NULL,
-                content_hash TEXT NOT NULL,
-                category TEXT NOT NULL DEFAULT '',
-                confidence REAL NOT NULL DEFAULT 0.0,
-                recall_count INTEGER NOT NULL DEFAULT 0,
-                last_recalled_at TEXT NOT NULL,
-                UNIQUE(person_id, content_hash)
-            )
-            """
-        )
-
     def _init_db(self) -> None:
         """初始化数据库：创建所有必需的数据表并执行增量迁移。
 
-        建表顺序考虑了外键依赖：sessions → messages → episodic → facts → profiles → l3
-        然后调用各 _migrate_* 方法处理增量字段和索引。
-        FTS5 虚拟表在最后创建（不支持 IF NOT EXISTS 语法，通过 try/except 处理）。
+        旧记忆表信息（仅用于 migrate 审计）
+        已通过一次性迁移删除，所有记忆数据统一存储在 memory_items 中。
         """
         with self._conn() as conn:
             conn.executescript(
@@ -395,7 +359,7 @@ class SessionStore:
                     created_at TEXT NOT NULL,
                     last_active TEXT NOT NULL
                 );
-                -- 消息表（L1 工作记忆）：记录每轮对话的 user/assistant 消息
+                -- 消息表：记录每轮对话的 user/assistant 消息
                 CREATE TABLE IF NOT EXISTS messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     session_id TEXT NOT NULL,
@@ -403,18 +367,6 @@ class SessionStore:
                     content TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(session_id) REFERENCES sessions(id)
-                );
-                -- L2 情景记忆表：会话压缩后的摘要
-                CREATE TABLE IF NOT EXISTS episodic_memories (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    device_id TEXT NOT NULL,
-                    session_id TEXT,
-                    summary TEXT NOT NULL,
-                    topics TEXT,
-                    open_loops TEXT,
-                    created_at TEXT NOT NULL,
-                    expires_at TEXT,
-                    archived INTEGER NOT NULL DEFAULT 0
                 );
                 -- 人物画像表：JSON 格式存储完整 Profile Card
                 CREATE TABLE IF NOT EXISTS person_profiles (
@@ -424,33 +376,11 @@ class SessionStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
-                -- L3 向量块表：聊天记忆/语料知识的向量化存储
-                -- embedding_json 存储浮点数向量的 JSON 序列化
-                -- text_fts 用于 FTS5 全文索引
-                CREATE TABLE IF NOT EXISTS l3_chunks (
-                    chunk_id TEXT PRIMARY KEY,
-                    collection TEXT NOT NULL,
-                    device_id TEXT NOT NULL DEFAULT '',
-                    text TEXT NOT NULL,
-                    text_fts TEXT NOT NULL,
-                    embedding_json TEXT NOT NULL,
-                    source TEXT,
-                    category TEXT,
-                    confidence REAL DEFAULT 0,
-                    created_at TEXT NOT NULL
-                );
-                -- FTS5 虚拟表：中文全文索引，unicode61 tokenizer 支持中文分词
-                CREATE VIRTUAL TABLE IF NOT EXISTS l3_chunks_fts USING fts5(
-                    chunk_id UNINDEXED,
-                    text_fts,
-                    tokenize='unicode61'
-                );
                 """
             )
             # 增量迁移：处理后续版本新增的字段
-            self._migrate_episodic(conn)
+            self._migrate_memory_items(conn)
             self._migrate_sessions(conn)
-            self._migrate_person_scope(conn)
             self._migrate_memory_relations(conn)
             self._migrate_relationship_state(conn)
             self._migrate_open_loops(conn)
@@ -543,7 +473,7 @@ class SessionStore:
                 return str(uuid4())
 
     def add_message(self, session_id: str, role: str, content: str) -> None:
-        """追加一条 L1 消息并更新会话 last_active 时间戳。
+        """向工作上下文追加一条消息并更新会话 last_active 时间戳。
 
         参数:
             session_id: 会话 ID
@@ -560,7 +490,7 @@ class SessionStore:
     def count_turns(self, session_id: str) -> int:
         """统计会话中 user 轮数（一条 user 消息 = 一轮）。
 
-        用于判断是否达到 L1 压缩阈值（working_memory_turns）。
+        用于判断是否达到工作上下文压缩阈值（working_context_turns）。
         """
         with self._conn() as conn:
             row = conn.execute(
@@ -570,11 +500,9 @@ class SessionStore:
         return int(row["n"]) if row else 0
 
     def get_recent_messages(self, session_id: str, limit: int) -> list[dict]:
-        """取最近 limit 条消息（按 ID 倒序取，再反转为正序）。
+        """取工作上下文最近 limit 条消息（按 ID 倒序取，再反转为正序）。
 
         返回格式: [{"role": "user", "content": "你好"}, ...]
-
-        用于 L1 working memory 注入 prompt（最近 N 轮对话上下文）。
         """
         with self._conn() as conn:
             rows = conn.execute(
@@ -587,9 +515,9 @@ class SessionStore:
         return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
     def get_oldest_messages(self, session_id: str, limit: int) -> list[dict]:
-        """获取会话中最旧的 limit 条消息（按 ID 升序）。
+        """获取工作上下文中最早的 limit 条消息（按 ID 升序）。
 
-        用于 L1 压缩：取出最早的一批消息交给 LLM 压缩为 L2 摘要。
+        用于上下文压缩：取出最早的一批消息交给 LLM 压缩为统一记忆库条目。
         返回包含 id 字段（压缩后需要删除这些消息）。
         """
         with self._conn() as conn:
@@ -603,9 +531,9 @@ class SessionStore:
         return [{"id": r["id"], "role": r["role"], "content": r["content"]} for r in rows]
 
     def delete_messages_by_ids(self, message_ids: list[int]) -> None:
-        """根据消息 ID 列表批量删除 L1 消息。
+        """根据消息 ID 列表批量删除工作上下文中的旧消息。
 
-        用于 L1 压缩后清理已处理的旧消息。
+        用于上下文压缩后清理已处理的旧消息。
         """
         if not message_ids:
             return
@@ -616,7 +544,7 @@ class SessionStore:
     def get_session_messages(self, session_id: str) -> list[dict]:
         """获取会话的所有消息（全部历史，按时间顺序）。
 
-        用于会话结束时的全量 L1→L2 压缩。
+        用于会话结束时的上下文全量归档。
         """
         with self._conn() as conn:
             rows = conn.execute(
@@ -631,12 +559,11 @@ class SessionStore:
             conn.execute("UPDATE sessions SET status='closed', last_active=? WHERE id=?", (_utc_now(), session_id))
 
     def finalize_session(self, session_id: str) -> None:
-        """结束会话：清空 L1 消息 + 清除 active_person_id。
+        """结束会话：清空工作上下文消息 + 清除 active_person_id。
 
         与 close_session 的区别：
-          finalize_session 会清除 L1 和解除 person 绑定，
-          用于访客结束会话（丢弃 L1 不写入 L2）。
-          L2/L3/画像数据保留不删。
+          finalize_session 会清空工作上下文和解除 person 绑定，
+          用于访客结束会话（不保留上下文），画像数据保留不删。
         """
         with self._conn() as conn:
             conn.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
@@ -648,6 +575,30 @@ class SessionStore:
                 """,
                 (_utc_now(), session_id),
             )
+
+    # ── Working Context 语义接口 ───────────────────────────────────────
+
+    def append_message(self, session_id: str, role: str, content: str) -> None:
+        """向工作上下文追加一条消息（语义名，同 add_message）。"""
+        self.add_message(session_id, role, content)
+
+    def list_recent_messages(self, session_id: str, limit: int) -> list[dict]:
+        """获取工作上下文最近的 N 条消息（语义名，同 get_recent_messages）。"""
+        return self.get_recent_messages(session_id, limit)
+
+    def compact_working_context(self, session_id: str, msg_limit: int) -> list[dict]:
+        """压缩工作上下文：取出最旧的 msg_limit 条消息并删除，返回这些消息。
+
+        用于工作上下文（Working Context）超过阈值时的压缩操作。
+        调用方应将这些消息交给 LLM 压缩为统一记忆库条目后归档。
+
+        Returns:
+            list[dict]: 被移除的旧消息列表（含 id/role/content）。
+        """
+        oldest = self.get_oldest_messages(session_id, msg_limit)
+        if oldest:
+            self.delete_messages_by_ids([m["id"] for m in oldest])
+        return oldest
 
     def list_idle_active_sessions(self, idle_before_iso: str) -> list[dict]:
         """列出在指定时间点之前无活动的活跃会话。
@@ -667,90 +618,72 @@ class SessionStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    # ============================
-    # L2 情景记忆（Episodic Memory）
-    # ============================
 
-    def add_episodic(
-        self,
-        device_id: str,
-        session_id: str,
-        summary: str,
-        topics: str = "",
-        open_loops: str = "",
-        *,
-        person_id: str = "",
-        emotion: str = "",
-        importance: int = 3,
-        people: str = "[]",
-        status: str = "active",
-    ) -> None:
-        """添加一条 L2 情景记忆记录。
-
-        参数:
-            device_id:  设备标识
-            session_id: 来源会话 ID
-            summary:    LLM 生成的会话摘要
-            topics:     话题列表（逗号分隔）
-            open_loops: 未决事项（需要后续跟进的话题）
-            person_id:  用户 ID（用于多用户隔离）
-            emotion:    情绪标签（如"开心"/"生气"/"焦虑"）
-            importance: 重要性 1-5（3=普通，4=重要事件，5=里程碑）
-            people:     涉及人物的 JSON 数组字符串
-            status:     状态：active/archived/corrected
-
-        自动设置 14 天过期时间（expires_at），比旧版 7 天长，
-        以支持更久的情感近况感知。
-        """
-        now = _utc_now()
-        exp = _expires_at()
-        pid = str(person_id or "").strip()
-        imp = max(1, min(5, int(importance))) if importance else 3
-        with self._conn() as conn:
-            conn.execute(
-                """
-                INSERT INTO episodic_memories(
-                    device_id, person_id, session_id, summary, topics, open_loops,
-                    created_at, expires_at, archived, emotion,
-                    importance, people, status
-                ) VALUES (?,?,?,?,?,?,?,?,0,?, ?,?,?)
-                """,
-                (device_id, pid, session_id, summary, topics, open_loops,
-                 now, exp, emotion, imp, people, status),
-            )
-
-    def list_episodic_active(
+    def list_active_recent_memory(
         self, device_id: str, person_id: str, limit: int = 30
     ) -> list[dict]:
-        """获取用户的活跃 L2 情景记忆行（未归档且未过期）。
+        """获取用户的活跃近期记忆（基于 memory_items，查询 episode/emotion 类型）。
 
-        返回按 ID 倒序（最新的在前），用于 prompt 中的 L2 注入。
-        包含重要性评分（importance）和涉及人物（people）等新字段。
+        返回按 created_at 倒序（最新的在前）。
         """
         del device_id
-        now = _utc_now()
         pid = str(person_id or "").strip()
+        if not pid:
+            return []
+        now = _utc_now()
         with self._conn() as conn:
             rows = conn.execute(
                 """
-                SELECT id, summary, topics, open_loops, emotion,
-                       created_at, expires_at, importance, people, status
-                FROM episodic_memories
-                WHERE person_id=? AND archived=0 AND expires_at > ?
-                ORDER BY id DESC LIMIT ?
+                SELECT id, content AS summary, context_json,
+                       created_at, expires_at, emotional_weight, tags_json, deleted_at
+                FROM memory_items
+                WHERE person_id=? AND kind IN ('episode','emotion')
+                  AND deleted_at='' AND (expires_at='' OR expires_at>?)
+                ORDER BY created_at DESC LIMIT ?
                 """,
                 (pid, now, limit),
             ).fetchall()
-        return [dict(r) for r in rows]
+        out: list[dict] = []
+        for r in rows:
+            d = dict(r)
+            try:
+                ctx = json.loads(d.get("context_json", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                ctx = {}
+            try:
+                tags = json.loads(d.get("tags_json", "[]"))
+            except (json.JSONDecodeError, TypeError):
+                tags = []
+            if not isinstance(tags, list):
+                tags = []
+            people = ", ".join(
+                t.replace("person:", "") for t in tags
+                if isinstance(t, str) and t.startswith("person:")
+            )
+            out.append({
+                "id": d["id"],
+                "summary": d.get("summary", ""),
+                "topics": ctx.get("topics", "") if isinstance(ctx, dict) else "",
+                "open_loops": ctx.get("open_loops", "") if isinstance(ctx, dict) else "",
+                "emotion": (ctx.get("emotion", ctx.get("mood", ""))
+                           if isinstance(ctx, dict) else ""),
+                "created_at": d.get("created_at", ""),
+                "expires_at": d.get("expires_at", ""),
+                "importance": int(ctx.get("importance", d.get("emotional_weight", 3)))
+                              if isinstance(ctx, dict) else int(d.get("emotional_weight", 3)),
+                "people": people,
+                "status": "active" if not d.get("deleted_at") else "archived",
+            })
+        return out
 
     def list_important_episodes(
         self, person_id: str, min_importance: int = 4, limit: int = 10,
     ) -> list[dict]:
-        """获取用户的重要情景记忆（高重要性事件，不受过期限制）。
+        """获取用户的重要情景记忆（高 emotional_weight 事件，不受过期限制）。
 
         参数:
             person_id:       用户 ID
-            min_importance:  最低重要性（4=重要事件，5=里程碑）
+            min_importance:  最低重要性（emotional_weight >= 此值）
             limit:           最多条数
 
         返回:
@@ -762,89 +695,105 @@ class SessionStore:
         with self._conn() as conn:
             rows = conn.execute(
                 """
-                SELECT id, summary, topics, open_loops, emotion,
-                       created_at, expires_at, importance, people, status
-                FROM episodic_memories
-                WHERE person_id=? AND importance>=? AND archived=0
-                ORDER BY importance DESC, id DESC LIMIT ?
+                SELECT id, content AS summary, context_json,
+                       created_at, expires_at, emotional_weight, tags_json
+                FROM memory_items
+                WHERE person_id=? AND kind IN ('episode','emotion')
+                  AND deleted_at='' AND emotional_weight>=?
+                ORDER BY emotional_weight DESC, created_at DESC LIMIT ?
                 """,
                 (pid, min_importance, limit),
             ).fetchall()
-        return [dict(r) for r in rows]
+        out: list[dict] = []
+        for r in rows:
+            d = dict(r)
+            try:
+                ctx = json.loads(d.get("context_json", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                ctx = {}
+            try:
+                tags = json.loads(d.get("tags_json", "[]"))
+            except (json.JSONDecodeError, TypeError):
+                tags = []
+            if not isinstance(tags, list):
+                tags = []
+            people = ", ".join(
+                t.replace("person:", "") for t in tags
+                if isinstance(t, str) and t.startswith("person:")
+            )
+            out.append({
+                "id": d["id"],
+                "summary": d.get("summary", ""),
+                "topics": ctx.get("topics", "") if isinstance(ctx, dict) else "",
+                "open_loops": ctx.get("open_loops", "") if isinstance(ctx, dict) else "",
+                "emotion": (ctx.get("emotion", ctx.get("mood", ""))
+                           if isinstance(ctx, dict) else ""),
+                "created_at": d.get("created_at", ""),
+                "expires_at": d.get("expires_at", ""),
+                "importance": int(ctx.get("importance", d.get("emotional_weight", 3)))
+                              if isinstance(ctx, dict) else int(d.get("emotional_weight", 3)),
+                "people": people,
+                "status": "active",
+            })
+        return out
 
-    def list_expired_episodic(self, device_id: str | None = None) -> list[dict]:
-        """获取已过期的 L2 情景记忆行（用于 l2_rollup_sweeper 归档到 Corpus）。
+    def list_expired_recent_memory(self, device_id: str | None = None) -> list[dict]:
+        """获取已过期的近期记忆行（用于 recent_memory_rollup_sweeper 归档到长期记忆）。
 
-        返回按 person_id 分组 + ID 升序排列（方便批量处理）。
+        从 memory_items 中查询 kind=episode/emotion 且 expires_at 已过期且未归档的记录。
+        返回按 person_id 分组 + created_at 升序排列（方便批量处理）。
         """
         del device_id
         now = _utc_now()
         with self._conn() as conn:
             rows = conn.execute(
                 """
-                SELECT id, device_id, person_id, session_id, summary, topics, open_loops, created_at, expires_at
-                FROM episodic_memories
-                WHERE archived=0 AND expires_at <= ?
-                ORDER BY person_id, id ASC
+                SELECT id, device_id, person_id, source_session, content AS summary,
+                       context_json, created_at, expires_at
+                FROM memory_items
+                WHERE kind IN ('episode','emotion') AND deleted_at=''
+                  AND expires_at != '' AND expires_at <= ?
+                ORDER BY person_id, created_at ASC
                 """,
                 (now,),
             ).fetchall()
-        return [dict(r) for r in rows]
+        out: list[dict] = []
+        for r in rows:
+            d = dict(r)
+            # 解析 context_json 中的 topics/open_loops 字段
+            try:
+                ctx = json.loads(d.get("context_json", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                ctx = {}
+            d["topics"] = ctx.get("topics", "")
+            d["open_loops"] = ctx.get("open_loops", "")
+            out.append(d)
+        return out
 
-    def archive_episodic(self, episodic_ids: list[int]) -> None:
-        """批量归档 L2 情景记忆记录（标记 archived=1，不删除数据）。"""
-        if not episodic_ids:
+    def archive_recent_memory(self, memory_item_ids: list[str]) -> None:
+        """批量归档近期记忆记录（设置 deleted_at，不删除数据）。"""
+        if not memory_item_ids:
             return
-        placeholders = ",".join("?" * len(episodic_ids))
+        now = _utc_now()
+        placeholders = ",".join("?" * len(memory_item_ids))
         with self._conn() as conn:
             conn.execute(
-                f"UPDATE episodic_memories SET archived=1 WHERE id IN ({placeholders})",
-                episodic_ids,
+                f"UPDATE memory_items SET deleted_at=? WHERE id IN ({placeholders})",
+                [now] + memory_item_ids,
             )
 
-    def list_episodic(self, device_id: str, person_id: str, limit: int = 20) -> list[dict]:
-        """获取用户活跃 L2 情景记忆（list_episodic_active 的别名方法）。"""
-        return self.list_episodic_active(device_id, person_id, limit)
-
-    def delete_episodic_for_person(self, person_id: str) -> int:
-        """删除指定用户的所有 L2 情景记忆（不可逆），返回删除条数。"""
+    def delete_recent_memory_for_person(self, person_id: str) -> int:
+        """软删除指定用户的所有近期记忆（memory_items 中 kind=episode/emotion）。"""
         pid = str(person_id or "").strip()
         if not pid:
             raise ValueError("person_id required")
+        now = _utc_now()
         with self._conn() as conn:
             cur = conn.execute(
-                "DELETE FROM episodic_memories WHERE person_id=?",
-                (pid,),
+                "UPDATE memory_items SET deleted_at=? WHERE person_id=? AND kind IN ('episode','emotion') AND deleted_at=''",
+                (now, pid),
             )
             return cur.rowcount
-
-    # ============================
-    # L3 Facts 管理
-    # ============================
-
-    def add_fact(
-        self,
-        device_id: str,
-        person_id: str,
-        fact: str,
-        category: str,
-        confidence: float,
-        source_session: str,
-    ) -> int | None:
-        """添加一条事实记录（已废弃，当前版本保留为 no-op 以兼容旧调用）。"""
-        return None
-
-    def get_fact_by_id(self, fact_id: int) -> dict | None:
-        """根据 ID 获取单条事实记录（已废弃，当前版本始终返回 None）。"""
-        return None
-
-    def get_fact_by_text(self, person_id: str, fact_text: str) -> dict | None:
-        """（已废弃）旧 Facts 表已移除，始终返回 None。"""
-        return None
-
-    def list_facts(self, device_id: str, person_id: str, limit: int = 50) -> list[dict]:
-        """（已废弃）旧 Facts 表已移除，始终返回空列表。"""
-        return []
 
     # ============================
     # 记忆关联图（Memory Relations）
@@ -860,7 +809,7 @@ class SessionStore:
         """插入或更新记忆关联边。
 
         参数:
-            from_id:       源记忆的 key（格式：fact:{id} 或 chunk:{chunk_id}）
+            from_id:       源记忆的 key（格式：memory:{uuid}）
             to_id:         目标记忆的 key
             relation_type: 关系类型（related, cause_effect, same_event 等）
             strength:      关联强度 0.0-1.0
@@ -899,7 +848,7 @@ class SessionStore:
         """获取与给定记忆键相关的关联边（双向查找：from 和 to 都查）。
 
         参数:
-            memory_keys:  记忆键列表（fact:{id} 或 chunk:{chunk_id}）
+            memory_keys:  记忆键列表（格式：memory:{uuid}）
             min_strength: 最低关联强度阈值
             limit:        返回上限
 
@@ -947,7 +896,7 @@ class SessionStore:
         return total
 
     def delete_relations_with_id_prefix(self, prefix: str) -> int:
-        """删除具有指定 ID 前缀的关联边（如"chunk:doc-"），返回删除数量。"""
+        """删除具有指定 ID 前缀的关联边，返回删除数量。"""
         p = str(prefix or "").strip()
         if not p:
             return 0
@@ -965,552 +914,66 @@ class SessionStore:
     def purge_persona_derived_memory(
         self,
         person_id: str,
-        *,
-        chunk_key_prefix: str = "chunk:doc-",
     ) -> dict[str, int]:
         """清除由 persona 语料导入生成的长期记忆块/关联边。
 
         参数:
             person_id:         用户 ID（通常是 persona_global）
-            chunk_key_prefix:  文档块的 key 前缀
 
         返回:
-            dict: {"l3_facts": 删除的块数, "relations": 删除的关联边数}
+            dict: {"memory_items": 删除的记忆条目数, "relations": 删除的关联边数}
 
         用途：
           重新导入语料时（ingest --reset），需要先清除所有由旧语料派生的记忆。
         """
         pid = str(person_id or "").strip()
-        stats = {"l3_facts": 0, "relations": 0}
+        stats = {"memory_items": 0, "relations": 0}
         if not pid:
             return stats
-        with self._conn() as conn:
-            chunk_rows = conn.execute(
-                """
-                SELECT chunk_id FROM l3_chunks
-                WHERE (collection='facts' OR chunk_id LIKE ?) AND person_id=?
-                """,
-                (f"{chunk_key_prefix}%", pid),
-            ).fetchall()
-            for row in chunk_rows:
-                cid = str(row["chunk_id"])
-                conn.execute("DELETE FROM l3_chunks WHERE chunk_id=?", (cid,))
-                conn.execute("DELETE FROM l3_chunks_fts WHERE chunk_id=?", (cid,))
-                stats["l3_facts"] += 1
-        stats["relations"] += self.delete_relations_with_id_prefix(chunk_key_prefix)
-        return stats
 
-    # ============================
-    # L3 向量块管理
-    # ============================
-
-    def l3_get_chunk(self, chunk_id: str) -> dict | None:
-        """根据 chunk_id 获取单个 L3 向量块信息。"""
-        cid = str(chunk_id or "").strip()
-        if not cid:
-            return None
-        with self._conn() as conn:
-            row = conn.execute(
-                """
-                SELECT chunk_id, text, collection, person_id, device_id
-                FROM l3_chunks WHERE chunk_id=?
-                """,
-                (cid,),
-            ).fetchone()
-        if not row:
-            return None
-        return dict(row)
-
-    def has_recent_emotional_event(self, person_id: str, title: str, hours: int = 24) -> bool:
-        """检查当天是否已记录过相同标题的情感事件（用于去重）。
-
-        Args:
-            person_id: 用户 ID
-            title:     情感事件标题
-            hours:     回溯时间窗口（小时），默认 24
-
-        Returns:
-            True 如果已存在。
-        """
-        if not person_id or not title:
-            return False
-        from datetime import datetime, timedelta, timezone
-        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
-        with self._conn() as conn:
-            row = conn.execute(
-                """
-                SELECT 1 FROM l3_chunks
-                WHERE person_id=? AND source='emotional_event_turn'
-                  AND created_at >= ? AND text LIKE ?
-                LIMIT 1
-                """,
-                (str(person_id).strip(), cutoff, f"%{title}%"),
-            ).fetchone()
-        return row is not None
-
-    def l3_delete_chunk(self, chunk_id: str) -> bool:
-        """删除指定的 L3 向量块及其全文索引，返回是否成功删除。"""
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM l3_chunks WHERE chunk_id=?", (chunk_id,)
-            ).fetchone()
-            if not row:
-                return False
-            conn.execute("DELETE FROM l3_chunks WHERE chunk_id=?", (chunk_id,))
-            conn.execute("DELETE FROM l3_chunks_fts WHERE chunk_id=?", (chunk_id,))
-            return True
-
-    def l3_find_chunks_by_text(
-        self,
-        text: str,
-        *,
-        collection: str | None = None,
-        device_id: str = "",
-        limit: int = 8,
-    ) -> list[dict]:
-        """通过文本内容查找 L3 向量块。
-
-        支持精确匹配和前缀匹配（length >= 12 时）。
-        用于记忆修正时找到需要修改的具体块。
-        """
-        needle = text.strip()
-        if not needle:
-            return []
-        collections = [collection] if collection else ["memory", "corpus"]
-        found: list[dict] = []
-        for coll in collections:
-            if coll == "memory" and device_id:
-                rows = self.l3_list_chunks(coll, device_id=device_id)
-            else:
-                rows = self.l3_list_chunks(coll)
-            for row in rows:
-                body = str(row.get("text", ""))
-                if needle == body or (len(needle) >= 12 and needle in body):
-                    found.append(
-                        {
-                            "chunk_id": row["chunk_id"],
-                            "collection": coll,
-                            "text": body[:400],
-                        }
-                    )
-                if len(found) >= limit:
-                    return found
-        return found
-
-    def _row_to_l3(self, row: sqlite3.Row) -> dict:
-        """将 SQLite 行转换为 L3 向量块字典格式。
-
-        自动解析 embedding_json，保留标准字段（chunk_id, text, embedding,
-        collection, device_id, person_id, source, category, confidence, created_at）。
-        """
-        emb = json.loads(row["embedding_json"]) if row["embedding_json"] else []
-        out = {
-            "chunk_id": row["chunk_id"],
-            "text": row["text"],
-            "embedding": emb,
-            "collection": row["collection"],
-            "device_id": row["device_id"],
-        }
-        if "person_id" in row.keys():
-            out["person_id"] = row["person_id"]
-        for key in ("source", "category", "confidence", "created_at"):
-            if key in row.keys():
-                out[key] = row[key]
-        return out
-
-    def l3_list_corpus_global(self) -> list[dict]:
-        """列出全局语料库向量块（未绑定到特定用户，即 person_id 为空）。"""
+        # 收集该用户的 memory_items 中属于语料导入的记录
         with self._conn() as conn:
             rows = conn.execute(
                 """
-                SELECT chunk_id, text, embedding_json, collection, device_id, person_id
-                FROM l3_chunks
-                WHERE collection='corpus' AND (person_id IS NULL OR person_id='')
-                """
-            ).fetchall()
-        return [self._row_to_l3(r) for r in rows]
-
-    def l3_list_corpus_for_person(self, person_id: str) -> list[dict]:
-        """列出绑定到指定用户的语料库向量块。"""
-        pid = str(person_id or "").strip()
-        if not pid:
-            return []
-        with self._conn() as conn:
-            rows = conn.execute(
-                """
-                SELECT chunk_id, text, embedding_json, collection, device_id, person_id
-                FROM l3_chunks
-                WHERE collection='corpus' AND person_id=?
+                SELECT id, source_table, source_id FROM memory_items
+                WHERE person_id=? AND (
+                    source_table='corpus'
+                    OR source IN ('ingest', '旧版_upsert')
+                )
                 """,
                 (pid,),
             ).fetchall()
-        return [self._row_to_l3(r) for r in rows]
 
-    def l3_list_recall_pool(
-        self,
-        person_id: str,
-        *,
-        extra_person_ids: list[str] | None = None,
-        limit: int = 200,
-    ) -> list[dict]:
-        """构建 L3 召回候选池：全局语料 + 当前用户 + 额外用户 + 系统 persona。
+        item_ids = [str(r["id"]) for r in rows]
 
-        这是向量检索的数据源，包含：
-          1. 全局语料（person_id IS NULL，所有用户共享的知识）
-          2. 当前用户绑定记忆
-          3. persona_global 系统知识
-          4. 额外指定的用户（如被提及的关联人物）
+        rel_keys = [f"memory:{item_id}" for item_id in item_ids]
+        if rel_keys:
+            stats["relations"] = self.delete_relations_for_keys(rel_keys)
 
-        限定最近 limit 条记录，避免用户数据积累后全量加载导致向量比对耗时过长。
-        """
-        pid = str(person_id or "").strip()
-        extras = [str(x).strip() for x in (extra_person_ids or []) if str(x).strip()]
-        clauses = ["(person_id IS NULL OR person_id='')"]
-        params: list[str] = []
-        if pid:
-            clauses.append("person_id=?")
-            params.append(pid)
-        for e in extras:
-            if e and e != pid:
-                clauses.append("person_id=?")
-                params.append(e)
-        where = " OR ".join(clauses)
+        # 删除 memory_items + FTS
         with self._conn() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT chunk_id, text, embedding_json, collection, device_id, person_id,
-                       source, category, confidence, created_at
-                FROM l3_chunks
-                WHERE {where}
-                ORDER BY created_at DESC
-                LIMIT ?
-                """,
-                params + [limit],
-            ).fetchall()
-        out: list[dict] = []
-        for r in rows:
-            item = self._row_to_l3(r)
-            item["source"] = r["source"]
-            item["category"] = r["category"]
-            item["confidence"] = r["confidence"]
-            out.append(item)
-        return out
+            for iid in item_ids:
+                conn.execute("DELETE FROM memory_items_fts WHERE id=?", (iid,))
+                conn.execute("DELETE FROM memory_items WHERE id=?", (iid,))
+                stats["memory_items"] += 1
 
-    def l3_fts_search_pool(
-        self,
-        query: str,
-        person_id: str,
-        *,
-        extra_person_ids: list[str] | None = None,
-        limit: int = 24,
-    ) -> list[dict]:
-        """全文检索 L3，结果限定在 l3_list_recall_pool 同一作用域。
+        return stats
 
-        使用 FTS5 联合查询 l3_chunks，先做全文检索拿到候选，
-        再过滤 person_id 作用域，取前 limit 条。
 
-        为什么需要作用域过滤：
-          FTS5 返回的是全表匹配结果，需要限定到当前用户 +
-          全局语料的范围内，防止用户 A 看到用户 B 的记忆。
-        """
-        from app.store.chunks import build_fts_match_query
 
-        match_q = build_fts_match_query(query)
-        if not match_q:
-            return []
-        pid = str(person_id or "").strip()
-        extras = [str(x).strip() for x in (extra_person_ids or []) if str(x).strip()]
-        allowed = {pid, *extras}
-        with self._conn() as conn:
-            rows = conn.execute(
-                """
-                SELECT c.chunk_id, c.text, c.embedding_json, c.collection, c.device_id,
-                       c.person_id, c.source, c.category, c.confidence, c.created_at
-                FROM l3_chunks_fts f
-                JOIN l3_chunks c ON c.chunk_id = f.chunk_id
-                WHERE l3_chunks_fts MATCH ?
-                LIMIT ?
-                """,
-                (match_q, limit * 4),  # 多取 4 倍候选，过滤后再截取 limit
-            ).fetchall()
-        out: list[dict] = []
-        for r in rows:
-            row_pid = str(r["person_id"] or "").strip()
-            if row_pid and row_pid not in allowed:
-                continue  # 不属于当前用户作用域，跳过
-            item = self._row_to_l3(r)
-            item["source"] = r["source"]
-            item["category"] = r["category"]
-            item["confidence"] = r["confidence"]
-            out.append(item)
-            if len(out) >= limit:
-                break
-        return out
 
-    def l3_count(
-        self, collection: str, *, device_id: str = "", person_id: str | None = None
-    ) -> int:
-        """统计指定集合中的向量块数量。
 
-        参数:
-            collection: 集合名（"memory", "corpus", "facts"）
-            device_id:  可选，按设备过滤
-            person_id:  可选，按用户过滤（仅 facts 集合生效）
-        """
-        with self._conn() as conn:
-            if collection == "facts" and person_id is not None:
-                row = conn.execute(
-                    """
-                    SELECT COUNT(*) AS n FROM l3_chunks
-                    WHERE collection=? AND person_id=?
-                    """,
-                    (collection, str(person_id).strip()),
-                ).fetchone()
-            elif device_id:
-                row = conn.execute(
-                    "SELECT COUNT(*) AS n FROM l3_chunks WHERE collection=? AND device_id=?",
-                    (collection, device_id),
-                ).fetchone()
-            else:
-                row = conn.execute(
-                    "SELECT COUNT(*) AS n FROM l3_chunks WHERE collection=?",
-                    (collection,),
-                ).fetchone()
-        return int(row["n"]) if row else 0
 
-    def l3_reset_all(self) -> None:
-        """清空所有 L3 向量块和全文索引（危险操作，不可逆）。"""
-        with self._conn() as conn:
-            conn.execute("DELETE FROM l3_chunks")
-            conn.execute("DELETE FROM l3_chunks_fts")
 
-    def l3_reset_corpus(self) -> None:
-        """清空全局 L3 语料（corpus/memory 集合 + person_id 为空）。
 
-        与 l3_reset_all 的区别：
-          只清空全局语料，保留用户个人记忆（person_id 不为空的记录）。
-        """
-        with self._conn() as conn:
-            ids = [
-                r[0]
-                for r in conn.execute(
-                    """
-                    SELECT chunk_id FROM l3_chunks
-                    WHERE collection IN ('corpus', 'memory')
-                      AND (person_id IS NULL OR person_id='')
-                    """
-                ).fetchall()
-            ]
-            conn.execute(
-                """
-                DELETE FROM l3_chunks
-                WHERE collection IN ('corpus', 'memory')
-                  AND (person_id IS NULL OR person_id='')
-                """
-            )
-            for cid in ids:
-                conn.execute("DELETE FROM l3_chunks_fts WHERE chunk_id=?", (cid,))
 
-    def l3_clear(self, collection: str, *, device_id: str = "") -> None:
-        """清空指定集合的 L3 向量块（可选按设备过滤）。"""
-        with self._conn() as conn:
-            if device_id:
-                ids = [
-                    r[0]
-                    for r in conn.execute(
-                        "SELECT chunk_id FROM l3_chunks WHERE collection=? AND device_id=?",
-                        (collection, device_id),
-                    ).fetchall()
-                ]
-                conn.execute(
-                    "DELETE FROM l3_chunks WHERE collection=? AND device_id=?",
-                    (collection, device_id),
-                )
-            else:
-                ids = [
-                    r[0]
-                    for r in conn.execute(
-                        "SELECT chunk_id FROM l3_chunks WHERE collection=?",
-                        (collection,),
-                    ).fetchall()
-                ]
-                conn.execute("DELETE FROM l3_chunks WHERE collection=?", (collection,))
-            for cid in ids:
-                conn.execute("DELETE FROM l3_chunks_fts WHERE chunk_id=?", (cid,))
 
-    def l3_bulk_upsert(self, rows: list[dict]) -> None:
-        """批量插入或更新 L3 向量块及其全文索引。
 
-        参数:
-            rows: list[dict]，每个元素包含:
-                  chunk_id, collection, device_id, person_id, text,
-                  embedding, source, category, confidence
 
-        使用 INSERT ... ON CONFLICT DO UPDATE 实现 upsert。
-        同时维护 FTS5 全文索引（先删后插，因为 FTS5 不支持 UPDATE）。
-        """
-        if not rows:
-            return
-        from app.store.chunks import prepare_fts_text
 
-        now = _utc_now()
-        with self._conn() as conn:
-            for row in rows:
-                cid = str(row["chunk_id"])
-                text = str(row["text"])
-                fts = prepare_fts_text(text)
-                emb_json = json.dumps(row["embedding"])
-                conn.execute(
-                    """
-                    INSERT INTO l3_chunks(
-                        chunk_id, collection, device_id, person_id, text, text_fts, embedding_json,
-                        source, category, confidence, created_at
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(chunk_id) DO UPDATE SET
-                        collection=excluded.collection,
-                        device_id=excluded.device_id,
-                        person_id=excluded.person_id,
-                        text=excluded.text,
-                        text_fts=excluded.text_fts,
-                        embedding_json=excluded.embedding_json,
-                        source=excluded.source,
-                        category=excluded.category,
-                        confidence=excluded.confidence
-                    """,
-                    (
-                        cid,
-                        row["collection"],
-                        str(row.get("device_id", "")),
-                        str(row.get("person_id", "")),
-                        text,
-                        fts,
-                        emb_json,
-                        str(row.get("source", "")),
-                        str(row.get("category", "")),
-                        float(row.get("confidence", 0.0)),
-                        now,
-                    ),
-                )
-                # FTS5 不支持 INSERT OR REPLACE，所以先删后插
-                conn.execute("DELETE FROM l3_chunks_fts WHERE chunk_id=?", (cid,))
-                conn.execute(
-                    "INSERT INTO l3_chunks_fts(chunk_id, text_fts) VALUES (?,?)",
-                    (cid, fts),
-                )
 
-    def l3_list_chunks(
-        self, collection: str, *, device_id: str = "", person_id: str | None = None
-    ) -> list[dict]:
-        """列出指定集合的 L3 向量块（可按设备或用户过滤）。"""
-        with self._conn() as conn:
-            if collection == "facts" and person_id is not None:
-                rows = conn.execute(
-                    """
-                    SELECT chunk_id, text, embedding_json, collection, device_id, person_id
-                    FROM l3_chunks WHERE collection=? AND person_id=?
-                    """,
-                    (collection, str(person_id).strip()),
-                ).fetchall()
-            elif device_id:
-                rows = conn.execute(
-                    """
-                    SELECT chunk_id, text, embedding_json, collection, device_id, person_id
-                    FROM l3_chunks WHERE collection=? AND device_id=?
-                    """,
-                    (collection, device_id),
-                ).fetchall()
-            elif collection == "corpus":
-                rows = conn.execute(
-                    """
-                    SELECT chunk_id, text, embedding_json, collection, device_id
-                    FROM l3_chunks WHERE collection=?
-                    """,
-                    (collection,),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT chunk_id, text, embedding_json, collection, device_id
-                    FROM l3_chunks WHERE collection=?
-                    """,
-                    (collection,),
-                ).fetchall()
-        return [self._row_to_l3(r) for r in rows]
 
-    def l3_list_person_memory(
-        self, person_id: str, *, device_id: str = "", limit: int = 50
-    ) -> list[dict]:
-        """列出某用户的 L3 长期记忆块（collection 为 memory 或 facts）。
 
-        返回按 created_at 降序（最新的在前），最多 limit 条。
-        """
-        pid = str(person_id or "").strip()
-        if not pid:
-            return []
-        with self._conn() as conn:
-            rows = conn.execute(
-                """
-                SELECT chunk_id, text, embedding_json, collection, device_id, person_id,
-                       source, category, confidence, created_at
-                FROM l3_chunks
-                WHERE person_id=? AND collection IN ('memory', 'facts')
-                ORDER BY created_at DESC
-                LIMIT ?
-                """,
-                (pid, limit),
-            ).fetchall()
-        return [self._row_to_l3(r) for r in rows]
-
-    def l3_fts_search(
-        self,
-        query: str,
-        *,
-        collection: str,
-        device_id: str = "",
-        person_id: str | None = None,
-        limit: int = 24,
-    ) -> list[dict]:
-        """使用 FTS5 全文搜索引擎查找 L3 向量块（带作用域过滤）。"""
-        from app.store.chunks import build_fts_match_query
-
-        match_q = build_fts_match_query(query)
-        if not match_q:
-            return []
-        with self._conn() as conn:
-            if collection == "facts" and person_id is not None:
-                rows = conn.execute(
-                    """
-                    SELECT c.chunk_id, c.text, c.embedding_json, c.collection, c.device_id, c.person_id
-                    FROM l3_chunks_fts f
-                    JOIN l3_chunks c ON c.chunk_id = f.chunk_id
-                    WHERE l3_chunks_fts MATCH ? AND c.collection=? AND c.person_id=?
-                    LIMIT ?
-                    """,
-                    (match_q, collection, str(person_id).strip(), limit),
-                ).fetchall()
-            elif device_id:
-                rows = conn.execute(
-                    """
-                    SELECT c.chunk_id, c.text, c.embedding_json, c.collection, c.device_id, c.person_id
-                    FROM l3_chunks_fts f
-                    JOIN l3_chunks c ON c.chunk_id = f.chunk_id
-                    WHERE l3_chunks_fts MATCH ? AND c.collection=? AND c.device_id=?
-                    LIMIT ?
-                    """,
-                    (match_q, collection, device_id, limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT c.chunk_id, c.text, c.embedding_json, c.collection, c.device_id, c.person_id
-                    FROM l3_chunks_fts f
-                    JOIN l3_chunks c ON c.chunk_id = f.chunk_id
-                    WHERE l3_chunks_fts MATCH ? AND c.collection=?
-                    LIMIT ?
-                    """,
-                    (match_q, collection, limit),
-                ).fetchall()
-        return [self._row_to_l3(r) for r in rows]
 
     # ============================
     # 会话身份管理
@@ -1681,274 +1144,1024 @@ class SessionStore:
         return normalize_profile(json.loads(row["profile_json"]))
 
     # ============================
-    # L0 核心记忆管理
+    # 统一记忆库 —— memory_items（所有长期/中期记忆的唯一存储层）
     # ============================
 
-    def l0_upsert(
+    @staticmethod
+    def _memory_item_content_hash(content: str) -> str:
+        """计算 memory_items content_hash（SHA256 前 16 位）。"""
+        import hashlib
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+
+    def memory_item_upsert(
+        self,
+        *,
+        person_id: str,
+        device_id: str,
+        kind: str,
+        source: str,
+        visibility: str,
+        content: str,
+        confidence: float = 1.0,
+        emotional_weight: int = 3,
+        recency_weight: int = 3,
+        context_json: str = "{}",
+        tags_json: str = "[]",
+        embedding_json: str = "[]",
+        source_table: str = "",
+        source_id: str = "",
+        source_session: str = "",
+        created_at: str = "",
+        expires_at: str = "",
+    ) -> str:
+        """插入或更新统一记忆库条目（按 source_table+source_id 幂等）。
+
+        Args:
+            person_id: 用户 ID
+            device_id: 设备 ID
+            kind: MemoryKind.value
+            source: MemorySource.value
+            visibility: MemoryVisibility.value
+            content: 记忆内容
+            confidence: 置信度 0.0-1.0
+            emotional_weight: 情感重要性 1-5
+            recency_weight: 时效重要性 1-5
+            context_json: JSON 序列化的 context dict
+            tags_json: JSON 序列化的 tags list
+            embedding_json: JSON 序列化的 embedding 数组
+            source_table: 来源表名（如 "migration" / "admin" / 历史来源）
+            source_id: 来源表的主键
+            source_session: 来源会话 ID
+            expires_at: 过期时间（ISO 格式）
+
+        Returns:
+            str: 写入的 memory_items id（自动生成的 UUID）。
+
+        幂等性保证：
+          - 当 source_table 和 source_id 均非空时，按 UNIQUE 索引 upsert
+          - 同时更新 memory_items_fts 全文索引
+        """
+        import uuid as _uuid
+
+        item_id = str(_uuid.uuid4())
+        c_hash = self._memory_item_content_hash(content)
+        now = _utc_now()
+        c_at = created_at or now
+        body_safe = " ".join((content or "").strip().split())
+
+        with self._conn() as conn:
+            # 检查是否已有相同 source_table+source_id 的记录
+            existing_id: str | None = None
+            if source_table and source_id:
+                row = conn.execute(
+                    "SELECT id FROM memory_items WHERE source_table=? AND source_id=?",
+                    (source_table, source_id),
+                ).fetchone()
+                if row:
+                    existing_id = str(row["id"])
+
+            if existing_id:
+                # 更新已有记录
+                conn.execute(
+                    """
+                    UPDATE memory_items SET
+                        person_id=?, device_id=?, kind=?, source=?, visibility=?,
+                        content=?, content_hash=?, confidence=?,
+                        emotional_weight=?, recency_weight=?,
+                        context_json=?, tags_json=?, embedding_json=?,
+                        source_session=?, expires_at=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        person_id, device_id, kind, source, visibility,
+                        body_safe, c_hash, float(confidence),
+                        int(emotional_weight), int(recency_weight),
+                        context_json, tags_json, embedding_json,
+                        source_session, expires_at, now,
+                        existing_id,
+                    ),
+                )
+                item_id = existing_id
+            else:
+                # 插入新记录
+                conn.execute(
+                    """
+                    INSERT INTO memory_items(
+                        id, person_id, device_id, kind, source, visibility,
+                        content, content_hash, confidence,
+                        emotional_weight, recency_weight,
+                        context_json, tags_json, embedding_json,
+                        source_table, source_id, source_session,
+                        expires_at, created_at, updated_at
+                    ) VALUES (?,?,?,?,?,?, ?,?,?, ?,?,?,?,?, ?,?,?, ?,?,?)
+                    """,
+                    (
+                        item_id, person_id, device_id, kind, source, visibility,
+                        body_safe, c_hash, float(confidence),
+                        int(emotional_weight), int(recency_weight),
+                        context_json, tags_json, embedding_json,
+                        source_table, source_id, source_session,
+                        expires_at, c_at, now,
+                    ),
+                )
+
+            # 更新 FTS5 全文索引（使用 bigram 预处理，兼容中文）
+            try:
+                from app.store.chunks import prepare_fts_text
+                fts_content = prepare_fts_text(body_safe)
+                conn.execute("DELETE FROM memory_items_fts WHERE id=?", (item_id,))
+                conn.execute(
+                    "INSERT INTO memory_items_fts(id, content_fts) VALUES (?,?)",
+                    (item_id, fts_content),
+                )
+            except Exception as exc:
+                logger.warning("memory_items_fts upsert failed for %s: %s", item_id, exc)
+
+        return item_id
+
+    def memory_item_get_by_source(
+        self, source_table: str, source_id: str,
+    ) -> dict | None:
+        """按 source_table+source_id 查找 memory_items 条目。"""
+        if not source_table or not source_id:
+            return None
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT id, person_id, device_id, kind, source, visibility,
+                       content, content_hash, confidence,
+                       emotional_weight, recency_weight,
+                       context_json, tags_json, embedding_json,
+                       source_table, source_id, source_session,
+                       expires_at, created_at, updated_at, deleted_at
+                FROM memory_items
+                WHERE source_table=? AND source_id=?
+                """,
+                (source_table, source_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def memory_item_list_for_person(
         self,
         person_id: str,
-        category: str,
-        content: str,
         *,
-        device_id: str = "",
-        source: str = "user_declared",
-        confidence: float = 1.0,
-    ) -> None:
-        """插入或更新 L0 核心记忆。
+        limit: int = 50,
+        kinds: list[str] | None = None,
+        visibility: str | None = None,
+    ) -> list[dict]:
+        """列出指定用户的 memory_items 条目。
 
-        参数:
-            person_id:  用户 ID
-            category:   分类（identity/taboo/key_people/milestone/preference）
-            content:    记忆内容文本
-            device_id:  来源设备
-            source:     来源类型（user_declared/l3_promotion/system）
-            confidence: 置信度 0.0-1.0
-
-        基于 (person_id, category, content_hash) 去重：
-          相同内容只存一条，更新时会刷新 confidence 和 updated_at。
-        """
-        import hashlib
-
-        pid = str(person_id or "").strip()
-        body = " ".join((content or "").strip().split())
-        if not pid or not body:
-            return
-        content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
-        now = _utc_now()
-        with self._conn() as conn:
-            conn.execute(
-                """
-                INSERT INTO l0_core_memories(
-                    person_id, device_id, category, content, content_hash,
-                    source, confidence, created_at, updated_at
-                ) VALUES (?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(person_id, category, content_hash) DO UPDATE SET
-                    content=excluded.content,
-                    source=excluded.source,
-                    confidence=excluded.confidence,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    pid,
-                    device_id or "",
-                    category,
-                    body,
-                    content_hash,
-                    source,
-                    float(confidence),
-                    now,
-                    now,
-                ),
-            )
-
-    def l0_list(self, person_id: str, *, category: str | None = None) -> list[dict]:
-        """列出用户的 L0 核心记忆（按优先级排序）。
-
-        排序规则（CASE category）：
-          identity(1) > taboo(2) > key_people(3) > milestone(4) > preference(5) > 其他(9)
-
-        身份最关键，禁忌次之，偏好最轻—— prompt 中 L0 按此顺序注入。
+        Args:
+            person_id: 用户 ID
+            limit: 返回上限
+            kinds: 按 kind 筛选（如 ["fact", "episode"]）
+            visibility: 按 visibility 筛选（如 "always", "recall_only"）
         """
         pid = str(person_id or "").strip()
         if not pid:
             return []
-        order = (
-            "CASE category "
-            "WHEN 'identity' THEN 1 WHEN 'taboo' THEN 2 WHEN 'key_people' THEN 3 "
-            "WHEN 'milestone' THEN 4 WHEN 'preference' THEN 5 ELSE 9 END, id ASC"
-        )
+        where = "person_id=?"
+        params: list[str] = [pid]
+        if kinds:
+            placeholders = ",".join("?" * len(kinds))
+            where += f" AND kind IN ({placeholders})"
+            params.extend(kinds)
+        if visibility:
+            where += " AND visibility=?"
+            params.append(visibility)
+        params.append(str(limit))
         with self._conn() as conn:
-            if category:
-                rows = conn.execute(
-                    f"""
-                    SELECT id, category, content, source, confidence, created_at
-                    FROM l0_core_memories
-                    WHERE person_id=? AND category=?
-                    ORDER BY {order}
-                    """,
-                    (pid, category),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    f"""
-                    SELECT id, category, content, source, confidence, created_at
-                    FROM l0_core_memories
-                    WHERE person_id=?
-                    ORDER BY {order}
-                    """,
-                    (pid,),
-                ).fetchall()
+            rows = conn.execute(
+                f"""
+                SELECT id, person_id, device_id, kind, source, visibility,
+                       content, content_hash, confidence,
+                       emotional_weight, recency_weight,
+                       context_json, tags_json, embedding_json,
+                       source_table, source_id, source_session,
+                       expires_at, created_at, updated_at, deleted_at
+                FROM memory_items
+                WHERE {where}
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
         return [dict(r) for r in rows]
 
-    def l0_count(self, person_id: str, category: str) -> int:
-        """统计用户指定类别的 L0 核心记忆数量。"""
+    def memory_item_search(
+        self,
+        person_id: str,
+        *,
+        kinds: list[str] | None = None,
+        visibility: str | None = None,
+        query: str = "",
+        month_key: str = "",
+        limit: int = 20,
+        embedding_json: str = "",
+        embedding_weight: float = 0.0,
+        extra_person_ids: list[str] | None = None,
+        include_expired: bool = False,
+    ) -> list[dict]:
+        """在 memory_items 统一表中执行语义检索（FTS + embedding 兜底 + 跨库补召）。
+
+        检索逻辑：
+          1. 当 query 非空时，优先走 memory_items_fts 全文索引命中
+          2. FTS 无命中但提供了 embedding_json 时，从同 person_id 候选中 cosine rerank 兜底
+          3. 当 query 为空时，按 updated_at DESC + confidence/emotional_weight/recency_weight 排序
+          4. 默认排除已过期条目（expires_at 非空且 <= 当前时间）
+
+        Args:
+            person_id: 主用户 ID
+            kinds: 按 kind 筛选（如 ["fact", "episode", "emotion"]）
+            visibility: 按 visibility 筛选（如 "always", "recall_only"）
+            query: FTS 查询文本
+            month_key: 月份标识（如 "2025-06"），只返回包含此月份的条目
+            limit: 返回上限
+            embedding_json: 用于 rerank 的 query embedding 序列化 JSON
+            embedding_weight: embedding rerank 的权重（0.0=仅 FTS，1.0=仅向量）
+            extra_person_ids: 额外 person_id 列表，用于跨用户补召（persona/corpus 语料）
+            include_expired: 是否包含已过期的条目（默认排除）
+
+        Returns:
+            list[dict]: memory_items 行列表，按相关性降序排列。
+        """
+        pids: list[str] = []
         pid = str(person_id or "").strip()
+        if pid:
+            pids.append(pid)
+        if extra_person_ids:
+            for ep in extra_person_ids:
+                ep_s = str(ep or "").strip()
+                if ep_s and ep_s not in pids:
+                    pids.append(ep_s)
+        if not pids:
+            return []
+        include_global_scope = bool(pid) and visibility != "always"
+
+        from datetime import datetime, timezone
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        def _month_needles(mk: str) -> list[str]:
+            mk = str(mk or "").strip()
+            if not mk:
+                return []
+            needles = [mk]
+            if "-" in mk:
+                year, month = mk.split("-", 1)
+                if year.isdigit() and month.isdigit():
+                    month_i = int(month)
+                    needles.extend([
+                        f"{year}年{month_i}月",
+                        f"{year}年{month_i:02d}月",
+                        f"{year}-{month_i}月",
+                        f"{year}-{month_i:02d}月",
+                    ])
+            return list(dict.fromkeys(needles))
+
+        def _row_has_month(row: dict, mk: str) -> bool:
+            needles = _month_needles(mk)
+            if not needles:
+                return True
+            haystack = " ".join(str(row.get(k, "") or "") for k in (
+                "content", "source", "source_table", "source_id",
+                "context_json", "tags_json",
+            ))
+            return any(n in haystack for n in needles)
+
+        def _month_row_priority(row: dict) -> tuple[int, int, str]:
+            """月份候选的轻量排序，保证关系查询不会被朋友/人物卡抢占。"""
+            import re as _re
+
+            q = str(query or "")
+            haystack = " ".join(str(row.get(k, "") or "") for k in (
+                "content", "source", "source_table", "source_id",
+                "context_json", "tags_json",
+            ))
+            asks_relationship = bool(_re.search(
+                r"我俩|我们俩|我们之间|咱俩|我和她|我和远慧|我跟你|远慧|刘远慧|秋雨",
+                q,
+            ))
+            asks_friend = bool(_re.search(r"唐凯|伍钰涛|朋友群|兄弟们|朋友", q))
+            if asks_relationship and asks_friend:
+                asks_friend = False
+            is_relationship = "刘远慧" in haystack or "远慧" in haystack
+            is_friend = any(token in haystack for token in ("唐凯", "伍钰涛", "袁子翔", "朋友群"))
+            if asks_relationship:
+                group = 0 if is_relationship else 1 if is_friend else 2
+            elif asks_friend:
+                group = 0 if is_friend else 1 if is_relationship else 2
+            else:
+                group = 0 if is_relationship else 1 if is_friend else 2
+            table_rank = 0 if str(row.get("source_table", "")) == "corpus" else 1
+            return (group, table_rank, str(row.get("source_id", "")))
+
+        def _build_person_clause() -> str:
+            """构建 person_id IN (...) 子句。"""
+            parts: list[str] = []
+            if include_global_scope:
+                parts.extend(["mi.person_id IS NULL", "mi.person_id=''"])
+            if len(pids) == 1:
+                parts.append("mi.person_id=?")
+            else:
+                placeholders = ",".join("?" * len(pids))
+                parts.append(f"mi.person_id IN ({placeholders})")
+            return "(" + " OR ".join(parts) + ")"
+
+        def _build_where_extra() -> tuple[str, list]:
+            """构建 kind/visibility/expires_at/deleted 筛选子句。"""
+            clauses: list[str] = []
+            params: list = list(pids)
+            if kinds:
+                placeholders = ",".join("?" * len(kinds))
+                clauses.append(f"mi.kind IN ({placeholders})")
+                params.extend(kinds)
+            if visibility:
+                clauses.append("mi.visibility=?")
+                params.append(visibility)
+            clauses.append("(mi.deleted_at IS NULL OR mi.deleted_at = '')")
+            if not include_expired:
+                clauses.append("(mi.expires_at IS NULL OR mi.expires_at = '' OR mi.expires_at > ?)")
+                params.append(now_iso)
+            return " AND ".join(clauses), params
+
+        with self._conn() as conn:
+            # ── 路径 A：FTS 全文检索 ──
+            candidates: list[dict] = []
+            if query.strip():
+                from app.store.chunks import prepare_fts_text
+                fts_q = prepare_fts_text(query)
+                if fts_q.strip():
+                    fts_terms = fts_q.split()
+                    seen: set[str] = set()
+                    unique_terms: list[str] = []
+                    for t in fts_terms:
+                        t_norm = t.strip().lower()
+                        if t_norm and t_norm not in seen:
+                            seen.add(t_norm)
+                            unique_terms.append(t_norm)
+                    if unique_terms:
+                        fts_match = " OR ".join(
+                            f'"{t}"' if " " not in t else t
+                            for t in unique_terms
+                        )
+                        person_clause = _build_person_clause()
+                        extra_clause, extra_params = _build_where_extra()
+                        # 去掉已加到 extra_params 的 pids（保留唯一一份）
+                        extra_params_for_fts = extra_params[len(pids):]
+                        fts_rows = conn.execute(
+                            f"""
+                            SELECT mi.id, mi.person_id, mi.device_id, mi.kind, mi.source,
+                                   mi.visibility, mi.content, mi.content_hash, mi.confidence,
+                                   mi.emotional_weight, mi.recency_weight,
+                                   mi.context_json, mi.tags_json, mi.embedding_json,
+                                   mi.source_table, mi.source_id, mi.source_session,
+                                   mi.expires_at, mi.created_at, mi.updated_at, mi.deleted_at
+                            FROM memory_items mi
+                            JOIN memory_items_fts fts ON mi.id = fts.id
+                            WHERE {person_clause}
+                              AND {extra_clause}
+                              AND fts.content_fts MATCH ?
+                            ORDER BY mi.updated_at DESC
+                            LIMIT ?
+                            """,
+                            (*pids, *extra_params_for_fts, fts_match, limit * 3),
+                        ).fetchall()
+                        candidates = [dict(r) for r in fts_rows]
+
+                # ── FTS 无命中且提供了 embedding_json → embedding 兜底 ──
+                if not candidates and embedding_json:
+                    try:
+                        import json as _json
+                        q_emb = _json.loads(embedding_json)
+                        if q_emb and isinstance(q_emb, list) and len(q_emb) > 0:
+                            from app.llm import cosine_similarity
+                            # 从同 person_ids 的候选池中按 kind/visibility 筛选
+                            extra_clause2, extra_params2 = _build_where_extra()
+                            extra_params_for_emb = extra_params2[len(pids):]
+                            pool_rows = conn.execute(
+                                f"""
+                                SELECT mi.id, mi.person_id, mi.device_id, mi.kind, mi.source,
+                                       mi.visibility, mi.content, mi.content_hash, mi.confidence,
+                                       mi.emotional_weight, mi.recency_weight,
+                                       mi.context_json, mi.tags_json, mi.embedding_json,
+                                       mi.source_table, mi.source_id, mi.source_session,
+                                       mi.expires_at, mi.created_at, mi.updated_at, mi.deleted_at
+                                FROM memory_items mi
+                                WHERE {_build_person_clause()}
+                                  AND {extra_clause2}
+                                  AND mi.embedding_json IS NOT NULL
+                                  AND mi.embedding_json != ''
+                                  AND mi.embedding_json != '[]'
+                                ORDER BY mi.updated_at DESC
+                                LIMIT ?
+                                """,
+                                (*pids, *extra_params_for_emb, limit * 5),
+                            ).fetchall()
+                            pool = [dict(r) for r in pool_rows]
+                            if pool:
+                                scored: list[tuple[dict, float]] = []
+                                for row in pool:
+                                    try:
+                                        row_emb = _json.loads(str(row.get("embedding_json", "[]") or "[]"))
+                                        if row_emb and len(row_emb) > 0 and len(q_emb) > 0:
+                                            sim = cosine_similarity(q_emb, row_emb)
+                                            scored.append((row, sim))
+                                        else:
+                                            scored.append((row, 0.0))
+                                    except (ValueError, TypeError, _json.JSONDecodeError):
+                                        scored.append((row, 0.0))
+                                lt_thresh = settings.long_term_memory_sim_threshold
+                                scored.sort(key=lambda x: -x[1])
+                                candidates = [r for r, s in scored
+                                              if s >= lt_thresh or s > 0.0]
+                    except Exception:
+                        logger.warning("memory_item_search embedding fallback failed", exc_info=True)
+            else:
+                # ── 路径 B：无 FTS，直接按条件筛选 ──
+                person_parts: list[str] = []
+                if include_global_scope:
+                    person_parts.extend(["person_id IS NULL", "person_id=''"])
+                if len(pids) == 1:
+                    person_parts.append("person_id=?")
+                else:
+                    person_parts.append(f"person_id IN ({','.join('?' * len(pids))})")
+                person_where = "(" + " OR ".join(person_parts) + ")"
+                where = f"{person_where} AND (deleted_at IS NULL OR deleted_at='')"
+                params: list[str | int] = list(pids)
+                if kinds:
+                    placeholders = ",".join("?" * len(kinds))
+                    where += f" AND kind IN ({placeholders})"
+                    params.extend(kinds)
+                if visibility:
+                    where += " AND visibility=?"
+                    params.append(visibility)
+                if not include_expired:
+                    where += " AND (expires_at IS NULL OR expires_at = '' OR expires_at > ?)"
+                    params.append(now_iso)
+                params.append(str(limit))
+                rows = conn.execute(
+                    f"""
+                    SELECT id, person_id, device_id, kind, source, visibility,
+                           content, content_hash, confidence,
+                           emotional_weight, recency_weight,
+                           context_json, tags_json, embedding_json,
+                           source_table, source_id, source_session,
+                           expires_at, created_at, updated_at, deleted_at
+                    FROM memory_items
+                    WHERE {where}
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    params,
+                ).fetchall()
+                candidates = [dict(r) for r in rows]
+
+            # ── 月份过滤（FTS 结果可能包含非月份内容） ──
+            if month_key and candidates:
+                filtered: list[dict] = []
+                for c in candidates:
+                    if _row_has_month(c, month_key):
+                        filtered.append(c)
+                if filtered:
+                    candidates = filtered
+                else:
+                    # ── FTS 候选没有任何月份匹配 → 执行 month_key 专用补召 ──
+                    # 用 month_key 重新执行 FTS 后仍需强过滤，避免 "20260702"
+                    # 这类包含 2025/06 分词但并非目标月份的 近期记忆 rollup 抢占结果。
+                    from app.store.chunks import build_fts_match_query
+
+                    month_fts = build_fts_match_query(month_key)
+                    if month_fts:
+                        person_clause_month = _build_person_clause()
+                        extra_clause_month, extra_params_month = _build_where_extra()
+                        extra_params_for_fts_month = extra_params_month[len(pids):]
+                        month_rows = conn.execute(
+                            f"""
+                            SELECT mi.id, mi.person_id, mi.device_id, mi.kind, mi.source,
+                                   mi.visibility, mi.content, mi.content_hash, mi.confidence,
+                                   mi.emotional_weight, mi.recency_weight,
+                                   mi.context_json, mi.tags_json, mi.embedding_json,
+                                   mi.source_table, mi.source_id, mi.source_session,
+                                   mi.expires_at, mi.created_at, mi.updated_at, mi.deleted_at
+                            FROM memory_items mi
+                            JOIN memory_items_fts fts ON mi.id = fts.id
+                            WHERE {person_clause_month}
+                              AND {extra_clause_month}
+                              AND fts.content_fts MATCH ?
+                            ORDER BY mi.updated_at DESC
+                            LIMIT ?
+                            """,
+                            (*pids, *extra_params_for_fts_month, month_fts, limit),
+                        ).fetchall()
+                        candidates = [
+                            dict(r) for r in month_rows
+                            if _row_has_month(dict(r), month_key)
+                        ]
+
+                    if len(candidates) < limit:
+                        needles = _month_needles(month_key)
+                        if needles:
+                            person_clause_like = _build_person_clause()
+                            extra_clause_like, extra_params_like = _build_where_extra()
+                            extra_params_for_like = extra_params_like[len(pids):]
+                            like_clauses: list[str] = []
+                            like_params: list[str] = []
+                            for n in needles:
+                                pat = f"%{n}%"
+                                like_clauses.append(
+                                    "(mi.content LIKE ? OR mi.source LIKE ? OR mi.source_id LIKE ? "
+                                    "OR mi.context_json LIKE ? OR mi.tags_json LIKE ?)"
+                                )
+                                like_params.extend([pat, pat, pat, pat, pat])
+                            like_rows = conn.execute(
+                                f"""
+                                SELECT mi.id, mi.person_id, mi.device_id, mi.kind, mi.source,
+                                       mi.visibility, mi.content, mi.content_hash, mi.confidence,
+                                       mi.emotional_weight, mi.recency_weight,
+                                       mi.context_json, mi.tags_json, mi.embedding_json,
+                                       mi.source_table, mi.source_id, mi.source_session,
+                                       mi.expires_at, mi.created_at, mi.updated_at, mi.deleted_at
+                                FROM memory_items mi
+                                WHERE {person_clause_like}
+                                  AND {extra_clause_like}
+                                  AND ({" OR ".join(like_clauses)})
+                                ORDER BY mi.updated_at DESC
+                                LIMIT ?
+                                """,
+                                (*pids, *extra_params_for_like, *like_params, max(limit * 5, 20)),
+                            ).fetchall()
+                            seen_ids = {str(c.get("id", "")) for c in candidates}
+                            for r in like_rows:
+                                row = dict(r)
+                                rid = str(row.get("id", ""))
+                                if rid and rid not in seen_ids:
+                                    seen_ids.add(rid)
+                                    candidates.append(row)
+
+                if len(candidates) < limit:
+                    needles = _month_needles(month_key)
+                    if needles:
+                        person_clause_like = _build_person_clause()
+                        extra_clause_like, extra_params_like = _build_where_extra()
+                        extra_params_for_like = extra_params_like[len(pids):]
+                        like_clauses: list[str] = []
+                        like_params: list[str] = []
+                        for n in needles:
+                            pat = f"%{n}%"
+                            like_clauses.append(
+                                "(mi.content LIKE ? OR mi.source LIKE ? OR mi.source_id LIKE ? "
+                                "OR mi.context_json LIKE ? OR mi.tags_json LIKE ?)"
+                            )
+                            like_params.extend([pat, pat, pat, pat, pat])
+                        like_rows = conn.execute(
+                            f"""
+                            SELECT mi.id, mi.person_id, mi.device_id, mi.kind, mi.source,
+                                   mi.visibility, mi.content, mi.content_hash, mi.confidence,
+                                   mi.emotional_weight, mi.recency_weight,
+                                   mi.context_json, mi.tags_json, mi.embedding_json,
+                                   mi.source_table, mi.source_id, mi.source_session,
+                                   mi.expires_at, mi.created_at, mi.updated_at, mi.deleted_at
+                            FROM memory_items mi
+                            WHERE {person_clause_like}
+                              AND {extra_clause_like}
+                              AND ({" OR ".join(like_clauses)})
+                            ORDER BY mi.updated_at DESC
+                            LIMIT ?
+                            """,
+                            (*pids, *extra_params_for_like, *like_params, max(limit * 5, 20)),
+                        ).fetchall()
+                        seen_ids = {str(c.get("id", "")) for c in candidates}
+                        for r in like_rows:
+                            row = dict(r)
+                            rid = str(row.get("id", ""))
+                            if rid and rid not in seen_ids:
+                                seen_ids.add(rid)
+                                candidates.append(row)
+
+                candidates.sort(key=_month_row_priority)
+
+            # ── 结果数量控制 ──
+            if len(candidates) > limit:
+                candidates = candidates[:limit]
+
+        return candidates
+
+    def memory_item_counts(self, person_id: str = "") -> dict:
+        """统计 memory_items 表中各 kind 的条目数和总新增数。
+
+        Args:
+            person_id: 可选，按用户过滤；为空时统计全局
+
+        Returns:
+            dict: {"total": N, "active": N, "by_kind": {"fact": N, ...}, "by_source_table": {...}}
+        """
+        where = "WHERE 1=1"
+        params: list[str] = []
+        if person_id:
+            where += " AND person_id=?"
+            params.append(person_id)
+        with self._conn() as conn:
+            # 总量
+            total_row = conn.execute(
+                f"SELECT COUNT(*) AS n FROM memory_items {where}", params,
+            ).fetchone()
+            total = int(total_row["n"]) if total_row else 0
+
+            # 按 kind 分组
+            kind_rows = conn.execute(
+                f"""
+                SELECT kind, COUNT(*) AS n FROM memory_items {where}
+                GROUP BY kind ORDER BY n DESC
+                """,
+                params,
+            ).fetchall()
+            by_kind = {str(r["kind"]): int(r["n"]) for r in kind_rows}
+
+            # 按 source_table 分组
+            source_rows = conn.execute(
+                f"""
+                SELECT source_table, COUNT(*) AS n FROM memory_items {where}
+                GROUP BY source_table ORDER BY n DESC
+                """,
+                params,
+            ).fetchall()
+            by_source = {str(r["source_table"]) or "none": int(r["n"]) for r in source_rows}
+
+            # 未软删除条数（deleted_at 为空）
+            active_where = f"{where} AND (deleted_at IS NULL OR deleted_at = '')"
+            active_row = conn.execute(
+                f"SELECT COUNT(*) AS n FROM memory_items {active_where}", params,
+            ).fetchone()
+            active = int(active_row["n"]) if active_row else 0
+
+        return {
+            "total": total,
+            "active": active,
+            "by_kind": by_kind,
+            "by_source_table": by_source,
+        }
+
+    # ── Unified Memory 语义接口 ────────────────────────────────────────
+
+    def write_memory_item(
+        self,
+        *,
+        person_id: str,
+        device_id: str,
+        kind: str,
+        source: str,
+        visibility: str,
+        content: str,
+        confidence: float = 1.0,
+        emotional_weight: int = 3,
+        recency_weight: int = 3,
+        context_json: str = "{}",
+        tags_json: str = "[]",
+        embedding_json: str = "[]",
+        source_table: str = "",
+        source_id: str = "",
+        source_session: str = "",
+        created_at: str = "",
+        expires_at: str = "",
+    ) -> str:
+        """写入统一记忆库条目（语义名，同 memory_item_upsert）。"""
+        return self.memory_item_upsert(
+            person_id=person_id, device_id=device_id, kind=kind,
+            source=source, visibility=visibility, content=content,
+            confidence=confidence, emotional_weight=emotional_weight,
+            recency_weight=recency_weight, context_json=context_json,
+            tags_json=tags_json, embedding_json=embedding_json,
+            source_table=source_table, source_id=source_id,
+            source_session=source_session, created_at=created_at,
+            expires_at=expires_at,
+        )
+
+    upsert_memory_item = write_memory_item  # 同名别名
+
+    def get_memory_item(self, item_id: str) -> dict | None:
+        """通过 ID 获取统一记忆库中的单条记录。"""
+        if not item_id:
+            return None
         with self._conn() as conn:
             row = conn.execute(
                 """
-                SELECT COUNT(*) AS n FROM l0_core_memories
-                WHERE person_id=? AND category=?
+                SELECT id, person_id, device_id, kind, source, visibility,
+                       content, content_hash, confidence,
+                       emotional_weight, recency_weight,
+                       context_json, tags_json, embedding_json,
+                       source_table, source_id, source_session,
+                       expires_at, created_at, updated_at, deleted_at
+                FROM memory_items WHERE id=?
                 """,
-                (pid, category),
+                (item_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_memory_items(
+        self,
+        person_id: str,
+        *,
+        limit: int = 50,
+        kinds: list[str] | None = None,
+        visibility: str | None = None,
+    ) -> list[dict]:
+        """列出指定用户的统一记忆库条目（语义名，同 memory_item_list_for_person）。"""
+        return self.memory_item_list_for_person(
+            person_id, limit=limit, kinds=kinds, visibility=visibility,
+        )
+
+    def search_memory_items(
+        self,
+        person_id: str,
+        *,
+        kinds: list[str] | None = None,
+        visibility: str | None = None,
+        query: str = "",
+        month_key: str = "",
+        limit: int = 20,
+        embedding_json: str = "",
+        embedding_weight: float = 0.0,
+        extra_person_ids: list[str] | None = None,
+        include_expired: bool = False,
+    ) -> list[dict]:
+        """在统一记忆库中执行语义检索（语义名，同 memory_item_search）。"""
+        return self.memory_item_search(
+            person_id, kinds=kinds, visibility=visibility,
+            query=query, month_key=month_key, limit=limit,
+            embedding_json=embedding_json, embedding_weight=embedding_weight,
+            extra_person_ids=extra_person_ids, include_expired=include_expired,
+        )
+
+    def count_memory_items(self, person_id: str = "") -> dict:
+        """统计统一记忆库中各 kind 的条目数（语义名，同 memory_item_counts）。"""
+        return self.memory_item_counts(person_id=person_id)
+
+    def count_corpus_memory_items(self) -> int:
+        """统计由 persona/corpus/ 导入的长期语料块数量。
+
+        识别规则：
+          - source_table='corpus'（新规范，所有 corpus 导入行标记为 corpus）
+          - 未被软删除
+        """
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM memory_items
+                WHERE (deleted_at IS NULL OR deleted_at = '')
+                  AND source_table='corpus'
+                """
             ).fetchone()
         return int(row["n"]) if row else 0
 
-    def l0_find_by_content(
-        self, person_id: str, content: str, category: str | None = None
-    ) -> dict | None:
-        """通过内容和类别查找 L0 核心记忆（基于 content_hash 去重匹配）。
+    def archive_memory_item(self, item_id: str) -> bool:
+        """软归档指定记忆条目（标记 deleted_at，不删除）。
 
-        用途：检查某事实是否已存在于 L0 中，避免重复写入。
+        管理员/调试用途，非运行时路径。
         """
-        import hashlib
-
-        pid = str(person_id or "").strip()
-        body = " ".join((content or "").strip().split())
-        if not pid or not body:
-            return None
-        content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
-        with self._conn() as conn:
-            if category:
-                row = conn.execute(
-                    """
-                    SELECT id, category, content FROM l0_core_memories
-                    WHERE person_id=? AND category=? AND content_hash=?
-                    """,
-                    (pid, category, content_hash),
-                ).fetchone()
-            else:
-                row = conn.execute(
-                    """
-                    SELECT id, category, content FROM l0_core_memories
-                    WHERE person_id=? AND content_hash=?
-                    """,
-                    (pid, content_hash),
-                ).fetchone()
-        return dict(row) if row else None
-
-    def l0_get(self, row_id: int) -> dict | None:
-        """按主键获取单条 L0 记录。"""
-        with self._conn() as conn:
-            row = conn.execute(
-                """
-                SELECT id, person_id, category, content, source, confidence, created_at, updated_at
-                FROM l0_core_memories WHERE id=?
-                """,
-                (row_id,),
-            ).fetchone()
-        return dict(row) if row else None
-
-    def l0_delete(self, row_id: int) -> bool:
-        """删除指定 ID 的 L0 核心记忆记录，返回是否成功。"""
-        with self._conn() as conn:
-            cur = conn.execute("DELETE FROM l0_core_memories WHERE id=?", (row_id,))
-            return cur.rowcount > 0
-
-    def l0_update(
-        self,
-        row_id: int,
-        *,
-        category: str,
-        content: str,
-        source: str = "manual",
-    ) -> bool:
-        """更新指定 L0 记录的类别与内容（重算 content_hash）。"""
-        import hashlib
-
-        body = " ".join((content or "").strip().split())
-        cat = str(category or "").strip()
-        if not body or not cat:
+        if not item_id:
             return False
-        content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
         now = _utc_now()
         with self._conn() as conn:
             cur = conn.execute(
-                """
-                UPDATE l0_core_memories
-                SET category=?, content=?, content_hash=?, source=?, updated_at=?
-                WHERE id=?
-                """,
-                (cat, body, content_hash, source, now, row_id),
+                "UPDATE memory_items SET deleted_at=? WHERE id=? AND (deleted_at IS NULL OR deleted_at='')",
+                (now, item_id),
             )
             return cur.rowcount > 0
 
-    def l0_delete_matching(self, person_id: str, substring: str) -> int:
-        """删除内容包含子字符串的 L0 记录（子串 >= 2 字符），返回删除数量。
-
-        用于记忆修正：用户说"不对，我没有 XX"，删除匹配的 L0 条目。
-        """
-        pid = str(person_id or "").strip()
-        sub = (substring or "").strip()
-        if not pid or len(sub) < 2:
-            return 0
+    def delete_memory_item(self, item_id: str) -> bool:
+        """硬删除指定记忆条目（仅管理/调试用途）。"""
+        if not item_id:
+            return False
         with self._conn() as conn:
-            cur = conn.execute(
-                "DELETE FROM l0_core_memories WHERE person_id=? AND content LIKE ?",
-                (pid, f"%{sub}%"),
-            )
-            return cur.rowcount
+            conn.execute("DELETE FROM memory_items_fts WHERE id=?", (item_id,))
+            cur = conn.execute("DELETE FROM memory_items WHERE id=?", (item_id,))
+            return cur.rowcount > 0
 
-    # ============================
-    # L3 召回统计（用于 L0 升级）
-    # ============================
+    def reset_corpus_items(self) -> int:
+        """清理所有 source_table='corpus' 的记忆条目及对应 FTS。
 
-    def l3_recall_bump(
-        self,
-        person_id: str,
-        content: str,
-        *,
-        category: str = "",
-        confidence: float = 0.0,
-    ) -> None:
-        """增加某条 L3 事实的召回计数。
-
-        每次从 L3 检索命中某条内容时调用，追踪被高频访问的事实。
-        当 recall_count >= l0_batch_min_recall 且
-        confidence >= l0_batch_min_confidence 时，可提升为 L0。
-
-        基于 (person_id, content_hash) 去重，use ON CONFLICT increment。
+        Returns:
+            删除的条目数。
         """
-        import hashlib
-
-        pid = str(person_id or "").strip()
-        body = " ".join((content or "").strip().split())
-        if not pid or len(body) < 4:
-            return
-        content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
-        now = _utc_now()
-        with self._conn() as conn:
-            conn.execute(
-                """
-                INSERT INTO l3_recall_stats(
-                    person_id, content, content_hash, category, confidence,
-                    recall_count, last_recalled_at
-                ) VALUES (?,?,?,?,?,1,?)
-                ON CONFLICT(person_id, content_hash) DO UPDATE SET
-                    recall_count=recall_count+1,
-                    category=CASE WHEN excluded.category!='' THEN excluded.category ELSE category END,
-                    confidence=CASE WHEN excluded.confidence>0 THEN excluded.confidence ELSE confidence END,
-                    last_recalled_at=excluded.last_recalled_at
-                """,
-                (pid, body, content_hash, category or "", float(confidence), now),
-            )
-
-    def l3_recall_list(self, person_id: str, *, min_count: int = 1) -> list[dict]:
-        """列出用户的 L3 召回统计（按召回次数降序）。
-
-        用于 profile_batch_sweeper 中的 L0 批量升级判断。
-        """
-        pid = str(person_id or "").strip()
         with self._conn() as conn:
             rows = conn.execute(
-                """
-                SELECT content, category, confidence, recall_count, last_recalled_at
-                FROM l3_recall_stats
-                WHERE person_id=? AND recall_count>=?
-                ORDER BY recall_count DESC, last_recalled_at DESC
-                """,
-                (pid, min_count),
+                "SELECT id FROM memory_items WHERE source_table='corpus'"
             ).fetchall()
-        return [dict(r) for r in rows]
+            ids = [r["id"] for r in rows]
+            if ids:
+                placeholders = ",".join("?" * len(ids))
+                conn.execute(
+                    f"DELETE FROM memory_items_fts WHERE id IN ({placeholders})",
+                    ids,
+                )
+                conn.execute(
+                    f"DELETE FROM memory_items WHERE source_table='corpus'",
+                )
+            return len(ids)
+
+    def list_corpus_source_ids(self) -> list[str]:
+        """返回所有 source_table='corpus' 的非空 source_id 列表。"""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT source_id FROM memory_items "
+                "WHERE source_table='corpus' AND source_id != ''"
+            ).fetchall()
+            return [str(r["source_id"]) for r in rows]
+
+    def delete_corpus_item_by_source_id(self, source_id: str) -> bool:
+        """按 source_id 删除一条 corpus 条目（同时删 FTS）。
+
+        对于 source_id 重复行仅删除第一条，重复行应在清理后用 audit 检测。"""
+        row = self.memory_item_get_by_source("corpus", source_id)
+        if row:
+            return self.delete_memory_item(str(row["id"]))
+        return False
+
+    def list_corpus_source_id_counts(self) -> dict[str, int]:
+        """统计 source_table='corpus' 下每个 source_id 的物理行数。
+
+        Returns:
+            dict[str, int]: {source_id: count, ...}
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT source_id, COUNT(*) AS n FROM memory_items "
+                "WHERE source_table='corpus' AND source_id != '' "
+                "GROUP BY source_id"
+            ).fetchall()
+            return {str(r["source_id"]): int(r["n"]) for r in rows}
+
+    def dedup_corpus_source_ids(self) -> int:
+        """去重 source_table='corpus' 下重复的 source_id 行。
+
+        保留每个 source_id 的第一个写入行（按 rowid 最早），删除多余的重复行。
+        自动清除对应的 FTS 条目。
+
+        Returns:
+            删除的冗余行数（无重复返回 0）。
+        """
+        with self._conn() as conn:
+            # 按 source_id 分组，每组只保留 rowid 最小的那条
+            keep_rows = conn.execute(
+                "SELECT source_id, MIN(rowid) AS r FROM memory_items "
+                "WHERE source_table='corpus' AND source_id != '' "
+                "GROUP BY source_id "
+                "HAVING COUNT(*) > 1"
+            ).fetchall()
+
+            if not keep_rows:
+                return 0
+
+            total_deleted = 0
+            for kr in keep_rows:
+                sid = kr["source_id"]
+                keep_r = int(kr["r"])
+                # 删除该 source_id 下 rowid 不等于最小的行
+                extra = conn.execute(
+                    "SELECT id FROM memory_items "
+                    "WHERE source_table='corpus' AND source_id=? "
+                    "AND rowid != ?",
+                    (sid, keep_r),
+                ).fetchall()
+                extra_ids = [r["id"] for r in extra]
+                if extra_ids:
+                    ph = ",".join("?" * len(extra_ids))
+                    conn.execute(
+                        f"DELETE FROM memory_items_fts WHERE id IN ({ph})",
+                        extra_ids,
+                    )
+                    conn.execute(
+                        "DELETE FROM memory_items WHERE source_table='corpus' AND source_id=? AND rowid != ?",
+                        (sid, keep_r),
+                    )
+                    total_deleted += len(extra_ids)
+            return total_deleted
+
+    def delete_corpus_items_by_source_path(self, source_path: str) -> int:
+        """删除与指定源文件相关的所有 corpus 条目（source_id LIKE '<path>#%'）。
+
+        Args:
+            source_path: 相对路径，如 'monthly/liu_yuanhui/2025-04.md'
+
+        Returns:
+            删除的条目数。
+        """
+        import sqlite3
+        pattern = f"{source_path}#%"
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT id FROM memory_items "
+                "WHERE source_table='corpus' AND source_id LIKE ?",
+                (pattern,),
+            ).fetchall()
+            if not rows:
+                return 0
+            ids = [r["id"] for r in rows]
+            placeholders = ",".join("?" * len(ids))
+            conn.execute(
+                f"DELETE FROM memory_items_fts WHERE id IN ({placeholders})",
+                ids,
+            )
+            conn.execute(
+                f"DELETE FROM memory_items WHERE id IN ({placeholders})",
+                ids,
+            )
+            return len(ids)
+
+    def list_corpus_source_ids_by_path(self, source_path: str) -> list[str]:
+        """返回与指定源文件相关的所有 corpus source_id 列表。
+
+        Args:
+            source_path: 相对路径，如 'monthly/liu_yuanhui/2025-04.md'
+
+        Returns:
+            list[str]: source_id 列表（保留重复条目）。
+        """
+        pattern = f"{source_path}#%"
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT source_id FROM memory_items "
+                "WHERE source_table='corpus' AND source_id LIKE ?",
+                (pattern,),
+            ).fetchall()
+            return [str(r["source_id"]) for r in rows]
+
+    # ── 语义视图（均基于 memory_items 统一表） ─────────────────────────
+
+    def list_core_facts(
+        self, person_id: str, *, limit: int = 50,
+    ) -> list[dict]:
+        """列出核心事实：仅返回稳定、高置信、适合常驻注入的 memory_items。
+
+        筛选规则：
+          - visibility=always（常驻注入）
+          - 按 kind 优先级排序（taboo > preference > relationship > entity > milestone）
+        """
+        pid = str(person_id or "").strip()
+        if not pid:
+            return []
+        rows = self.memory_item_search(
+            pid, kinds=None, visibility="always", limit=limit,
+        )
+        _CORE_PRIORITY = {
+            "taboo": 0, "preference": 1, "relationship": 2,
+            "entity": 3, "milestone": 4,
+        }
+        rows.sort(key=lambda r: _CORE_PRIORITY.get(r.get("kind", ""), 9))
+        return rows[:limit]
+
+    def search_recent_memory(
+        self,
+        person_id: str,
+        query: str = "",
+        *,
+        limit: int = 20,
+        month_key: str = "",
+    ) -> list[dict]:
+        """近期记忆语义视图：只查 episode / emotion / open_loop / milestone。
+
+        用于获取近期发生的事件、情绪变化和活跃待办。
+        """
+        pid = str(person_id or "").strip()
+        if not pid:
+            return []
+        return self.memory_item_search(
+            pid,
+            kinds=["episode", "emotion", "milestone"],
+            visibility="recall_only",
+            query=query,
+            month_key=month_key,
+            limit=limit,
+        )
+
+    def search_long_term_memory(
+        self,
+        person_id: str,
+        query: str = "",
+        *,
+        limit: int = 20,
+        month_key: str = "",
+        embedding_json: str = "",
+        extra_person_ids: list[str] | None = None,
+    ) -> list[dict]:
+        """长期记忆语义视图：查 fact / entity / wiki / relationship / episode。
+
+        用于获取可长期召回的稳定知识、实体关系和里程碑事件。
+        """
+        pid = str(person_id or "").strip()
+        if not pid:
+            return []
+        return self.memory_item_search(
+            pid,
+            kinds=["fact", "entity", "wiki", "relationship", "episode"],
+            visibility="recall_only",
+            query=query,
+            month_key=month_key,
+            limit=limit,
+            embedding_json=embedding_json,
+            extra_person_ids=extra_person_ids,
+        )
 
     # ============================
     # 后台管理辅助方法
@@ -2001,156 +2214,45 @@ class SessionStore:
             ).fetchone()
         return dict(row) if row else None
 
-    def list_episodic_for_person_admin(self, person_id: str, *, limit: int = 20) -> list[dict]:
-        """后台管理：按用户列出情景摘要。"""
-        pid = str(person_id or "").strip()
-        with self._conn() as conn:
-            rows = conn.execute(
-                """
-                SELECT id, device_id, person_id, session_id, summary, topics, open_loops,
-                       created_at, expires_at, archived, emotion, importance, people, status
-                FROM episodic_memories
-                WHERE person_id=?
-                ORDER BY created_at DESC LIMIT ?
-                """,
-                (pid, int(limit)),
-            ).fetchall()
-        return [dict(r) for r in rows]
-
-    def count_episodic_for_person(self, person_id: str) -> int:
-        """后台管理：统计指定用户情景摘要数量。"""
-        pid = str(person_id or "").strip()
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) AS n FROM episodic_memories WHERE person_id=?",
-                (pid,),
-            ).fetchone()
-        return int(row["n"]) if row else 0
-
-    def get_episodic_by_id(self, episodic_id: int) -> dict | None:
-        """后台管理：获取单条 L2 情景记忆。"""
-        with self._conn() as conn:
-            row = conn.execute(
-                """
-                SELECT id, device_id, person_id, session_id, summary, topics, open_loops,
-                       created_at, expires_at, archived, emotion, importance, people, status
-                FROM episodic_memories WHERE id=?
-                """,
-                (episodic_id,),
-            ).fetchone()
-        return dict(row) if row else None
-
-    def delete_episodic_by_id(self, episodic_id: int) -> bool:
-        """后台管理：删除单条 L2 情景记忆。"""
-        with self._conn() as conn:
-            cur = conn.execute(
-                "DELETE FROM episodic_memories WHERE id=?", (episodic_id,)
-            )
-            return cur.rowcount > 0
-
-    def update_episodic_admin(
-        self, episodic_id: int, **kwargs
-    ) -> bool:
-        """后台管理：更新 L2 情景记忆字段。"""
-        allowed = {"summary", "topics", "emotion", "importance", "status"}
-        updates = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
-        if not updates:
-            return False
-        sets = ", ".join(f"{k}=?" for k in updates)
-        vals = list(updates.values()) + [episodic_id]
-        with self._conn() as conn:
-            cur = conn.execute(
-                f"UPDATE episodic_memories SET {sets} WHERE id=?", vals
-            )
-            return cur.rowcount > 0
-
-    def l3_list_chunks_detailed(
-        self, collection: str | None = None, person_id: str | None = None,
-        *, limit: int = 100, offset: int = 0,
-    ) -> list[dict]:
-        """后台管理：列出 L3 向量块（含 source/category/confidence/created_at）。"""
-        where = "WHERE 1=1"
-        params: list[str] = []
-        if collection:
-            where += " AND collection=?"
-            params.append(collection)
-        if person_id:
-            where += " AND person_id=?"
-            params.append(str(person_id))
-        params.append(str(limit))
-        params.append(str(offset))
-        with self._conn() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT chunk_id, text, collection, device_id, person_id,
-                       source, category, confidence, created_at
-                FROM l3_chunks {where}
-                ORDER BY created_at DESC LIMIT ? OFFSET ?
-                """,
-                params,
-            ).fetchall()
-        return [dict(r) for r in rows]
-
-    def count_l3_for_person(self, person_id: str) -> int:
-        """后台管理：统计指定用户长期记忆块数量。"""
-        pid = str(person_id or "").strip()
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) AS n FROM l3_chunks WHERE person_id=?",
-                (pid,),
-            ).fetchone()
-        return int(row["n"]) if row else 0
-
-    def list_memory_relations_admin(self, *, limit: int = 120) -> list[dict]:
-        """后台管理：列出关联图边，用于关系图谱可视化。"""
-        with self._conn() as conn:
-            rows = conn.execute(
-                """
-                SELECT from_id, to_id, relation_type, strength, created_at
-                FROM memory_relations
-                ORDER BY strength DESC, created_at DESC
-                LIMIT ?
-                """,
-                (int(limit),),
-            ).fetchall()
-        return [dict(r) for r in rows]
-
-    def l3_update_chunk(self, chunk_id: str, *, text: str | None = None,
-                        category: str | None = None) -> bool:
-        """后台管理：更新 L3 向量块文本（同时更新 FTS5 索引）。"""
-        updates: dict[str, object] = {}
-        if text is not None:
-            updates["text"] = text
-            updates["text_fts"] = text
-        if category is not None:
-            updates["category"] = str(category).strip()
-        if not updates:
-            return False
-        sets = ", ".join(f"{k}=?" for k in updates)
-        vals = list(updates.values()) + [chunk_id]
-        with self._conn() as conn:
-            cur = conn.execute(
-                f"UPDATE l3_chunks SET {sets} WHERE chunk_id=?", vals
-            )
-            ok = cur.rowcount > 0
-            if ok and text is not None:
-                conn.execute(
-                    "UPDATE l3_chunks_fts SET text_fts=? WHERE chunk_id=?",
-                    (text, chunk_id),
-                )
-            return ok
-
     def count_memory_stat(self) -> dict:
-        """后台管理：统计各记忆数量和活跃会话数。"""
+        """后台管理：统计统一记忆库、画像、会话等全局数据量。"""
         with self._conn() as conn:
-            l0 = conn.execute("SELECT COUNT(*) FROM l0_core_memories").fetchone()[0]
-            l2 = conn.execute("SELECT COUNT(*) FROM episodic_memories WHERE archived=0").fetchone()[0]
-            l2_total = conn.execute("SELECT COUNT(*) FROM episodic_memories").fetchone()[0]
-            l3 = conn.execute("SELECT COUNT(*) FROM l3_chunks").fetchone()[0]
+            mi_total = conn.execute("SELECT COUNT(*) FROM memory_items").fetchone()[0]
+            mi_active = conn.execute(
+                "SELECT COUNT(*) FROM memory_items WHERE deleted_at IS NULL OR deleted_at=''"
+            ).fetchone()[0]
             profiles = conn.execute("SELECT COUNT(*) FROM person_profiles").fetchone()[0]
+            sessions_active = conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE status='active'"
+            ).fetchone()[0]
+
+            # 统一语义统计
+            core = conn.execute(
+                "SELECT COUNT(*) FROM memory_items WHERE visibility='always' AND deleted_at=''"
+            ).fetchone()[0]
+            episodes = conn.execute(
+                "SELECT COUNT(*) FROM memory_items WHERE kind IN ('episode','emotion') AND deleted_at=''"
+            ).fetchone()[0]
+            long_term = conn.execute(
+                "SELECT COUNT(*) FROM memory_items WHERE kind NOT IN ('episode','emotion') AND visibility='recall_only' AND deleted_at=''"
+            ).fetchone()[0]
+
+            by_kind: dict[str, int] = {}
+            for r in conn.execute(
+                "SELECT kind, COUNT(*) AS n FROM memory_items WHERE deleted_at='' GROUP BY kind ORDER BY n DESC"
+            ).fetchall():
+                by_kind[str(r["kind"])] = r["n"]
+
         return {
-            "core_memories": l0, "episodes_active": l2, "episodes_total": l2_total,
-            "long_term_memory": l3, "profiles": profiles,
+            "memory_items": mi_total,
+            "memory_items_active": mi_active,
+            "core_memories": core,
+            "episodes_total": episodes,
+            "episodes_active": episodes,
+            "long_term_memory": long_term,
+            "profiles": profiles,
+            "active_sessions": sessions_active,
+            "by_kind": by_kind,
         }
 
     # ============================
@@ -2197,51 +2299,129 @@ class SessionStore:
             )
         return out
 
-    def list_episodic_since(
+    def list_recent_memory_since(
         self, person_id: str, since_iso: str, *, limit: int = 40
     ) -> list[dict]:
-        """获取用户在指定时间点后创建的活跃情景记忆（用于 Profile 增量更新）。"""
+        """获取用户在指定时间点后创建的近期记忆（用于 Profile 增量更新）。
+
+        从 memory_items 中查询。
+        """
         pid = str(person_id or "").strip()
+        if not pid:
+            return []
         with self._conn() as conn:
             rows = conn.execute(
                 """
-                SELECT id, summary, topics, open_loops, created_at, expires_at
-                FROM episodic_memories
-                WHERE person_id=? AND archived=0 AND created_at >= ?
-                ORDER BY id DESC LIMIT ?
+                SELECT id, content AS summary, context_json, created_at, expires_at
+                FROM memory_items
+                WHERE person_id=? AND kind IN ('episode','emotion')
+                  AND deleted_at='' AND created_at >= ?
+                ORDER BY created_at DESC LIMIT ?
                 """,
                 (pid, since_iso, limit),
             ).fetchall()
-        return [dict(r) for r in rows]
+        out: list[dict] = []
+        for r in rows:
+            d = dict(r)
+            try:
+                ctx = json.loads(d.get("context_json", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                ctx = {}
+            out.append({
+                "id": d["id"],
+                "summary": d.get("summary", ""),
+                "topics": ctx.get("topics", "") if isinstance(ctx, dict) else "",
+                "open_loops": ctx.get("open_loops", "") if isinstance(ctx, dict) else "",
+                "created_at": d.get("created_at", ""),
+                "expires_at": d.get("expires_at", ""),
+            })
+        return out
 
     def list_facts_since(
         self, person_id: str, since_iso: str, *, limit: int = 60
     ) -> list[dict]:
-        """获取用户在指定时间点后创建的长期记忆块（替换旧 Facts 表，用于 Profile 增量更新）。"""
+        """获取用户在指定时间点后创建的长期记忆块（基于 memory_items，用于 Profile 增量更新）。"""
         pid = str(person_id or "").strip()
+        if not pid:
+            return []
         with self._conn() as conn:
             rows = conn.execute(
                 """
-                SELECT text AS fact, category, confidence, created_at FROM l3_chunks
-                WHERE person_id=? AND created_at >= ?
-                ORDER BY rowid DESC LIMIT ?
+                SELECT content AS fact, kind AS category, confidence, created_at
+                FROM memory_items
+                WHERE person_id=? AND kind NOT IN ('episode','emotion')
+                  AND deleted_at='' AND created_at >= ?
+                ORDER BY created_at DESC LIMIT ?
                 """,
                 (pid, since_iso, limit),
             ).fetchall()
         return [dict(r) for r in rows]
 
     def list_recall_person_ids(self, *, min_count: int = 3) -> list[str]:
-        """列出有足够召回次数的所有用户 ID（用于 L0 批量升级扫描）。"""
+        """列出有足够记忆条目的所有用户 ID。"""
         with self._conn() as conn:
             rows = conn.execute(
                 """
-                SELECT DISTINCT person_id FROM l3_recall_stats
-                WHERE recall_count >= ? AND person_id != ''
-                ORDER BY person_id
+                SELECT person_id, COUNT(*) AS cnt FROM memory_items
+                WHERE kind NOT IN ('episode','emotion') AND deleted_at='' AND person_id != ''
+                GROUP BY person_id HAVING cnt >= ?
+                ORDER BY cnt DESC
                 """,
                 (min_count,),
             ).fetchall()
         return [str(r["person_id"]) for r in rows]
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # 长期记忆查询接口
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def list_person_long_term_memory(
+        self, person_id: str, *, device_id: str = "", limit: int = 50
+    ) -> list[dict]:
+        """列出某用户的长期记忆项（从统一记忆库 memory_items 中查询）。"""
+        pid = str(person_id or "").strip()
+        if not pid:
+            return []
+        del device_id
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, content AS text, kind AS category, confidence,
+                       source, created_at, context_json, tags_json
+                FROM memory_items
+                WHERE person_id=? AND kind NOT IN ('episode','emotion')
+                  AND deleted_at=''
+                ORDER BY created_at DESC LIMIT ?
+                """,
+                (pid, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_memory_items_detailed(
+        self, collection: str | None = None, person_id: str | None = None,
+        *, limit: int = 100, offset: int = 0,
+    ) -> list[dict]:
+        """后台管理：列出统一记忆项。"""
+        where = "WHERE deleted_at=''"
+        params: list[str] = []
+        if person_id:
+            where += " AND person_id=?"
+            params.append(person_id)
+        if collection:
+            where += " AND kind=?"
+            params.append(collection)
+        params.extend([str(limit), str(offset)])
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, content AS text, kind AS collection, device_id, person_id,
+                       source, kind AS category, confidence, created_at
+                FROM memory_items {where}
+                ORDER BY created_at DESC LIMIT ? OFFSET ?
+                """,
+                params,
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def get_person_device_id(self, person_id: str) -> str:
         """获取用户关联的设备 ID（从画像表获取）。
@@ -2339,7 +2519,7 @@ class SessionStore:
     # ============================
 
     def rename_person_id(self, old_id: str, new_id: str) -> dict[str, int]:
-        """将 person_id 在所有记忆表中重命名（在同一事务内完成，保证原子性）。
+        """将 person_id 在所有记忆表/画像/会话中重命名（原子操作）。
 
         参数:
             old_id: 旧的 person_id
@@ -2351,11 +2531,10 @@ class SessionStore:
         操作流程（全部在一个事务内）：
           1. 校验 old_id 存在、new_id 不冲突
           2. 删除旧画像，插入新画像（person_id 改为 new_id）
-          3. 更新 episodic_memories, l3_chunks,
-             l0_core_memories, l3_recall_stats 中的 person_id
+          3. 更新 memory_items 统一记忆库中的 person_id
           4. 更新 sessions 表中的 active_person_id
 
-        为什么不用 UPDATE：
+        为什么不用 UPDATE person_profiles：
           person_profiles 的主键是 person_id，UPDATE 会触发 UNIQUE 约束。
           所以走 DELETE + INSERT 路径。
         """
@@ -2398,18 +2577,14 @@ class SessionStore:
             )
 
             counts: dict[str, int] = {"person_profiles": 1}
-            # 级联更新所有记忆表
-            for table in (
-                "episodic_memories",
-                "l3_chunks",
-                "l0_core_memories",
-                "l3_recall_stats",
-            ):
-                cur = conn.execute(
-                    f"UPDATE {table} SET person_id=? WHERE person_id=?",
-                    (new_id, old_id),
-                )
-                counts[table] = int(cur.rowcount)
+
+            # 统一记忆库（memory_items）
+            cur = conn.execute(
+                "UPDATE memory_items SET person_id=? WHERE person_id=?",
+                (new_id, old_id),
+            )
+            counts["memory_items"] = int(cur.rowcount)
+
             # 会话表
             cur = conn.execute(
                 "UPDATE sessions SET active_person_id=? WHERE active_person_id=?",
@@ -2425,18 +2600,12 @@ class SessionStore:
             person_id: 要删除的用户 ID
 
         返回:
-            dict: {"memory_relations": ..., "l3_chunks": ..., "episodic_memories": ...,
-                   "l0_core_memories": ..., "l3_recall_stats": ...,
-                   "person_profiles": ..., "sessions": ...}
+            dict: 各表被删除/更新的记录数
 
         删除范围：
-          1. 找到该用户的所有长期记忆块 → 收集 chunk key
-          2. 删除所有关联图的边
-          3. 删除长期记忆块（同时清理 FTS5 索引）
-          4. 删除情景摘要/L0/recall_stats 记录
-          5. 删除画像
-          6. 清除活跃会话中的 person 绑定
-          7. 清除 identity_pending 中的相关记录
+          1. 删除 memory_items 统一记忆库（含 FTS5 索引）与关联图边
+          2. 删除画像
+          3. 清除活跃会话中的 person 绑定
         """
         pid = str(person_id or "").strip()
         if not pid:
@@ -2448,38 +2617,23 @@ class SessionStore:
             ).fetchone():
                 raise ValueError("person not found")
 
-            # 收集要清理的 chunk key
-            chunk_rows = conn.execute(
-                "SELECT chunk_id FROM l3_chunks WHERE person_id=?",
+            # 收集统一记忆项 ID（用于关联图清理）
+            mi_rows = conn.execute(
+                "SELECT id FROM memory_items WHERE person_id=?",
                 (pid,),
             ).fetchall()
 
-        chunk_ids = [str(r["chunk_id"]) for r in chunk_rows if r["chunk_id"]]
+        mi_ids = [str(r["id"]) for r in mi_rows]
+        rel_keys = [f"memory:{item_id}" for item_id in mi_ids]
+        rel_deleted = self.delete_relations_for_keys(rel_keys) if rel_keys else 0
 
-        # 删除关联图边
-        rel_deleted = 0
-        if chunk_ids:
-            from app.memory.relations import chunk_key
-
-            rel_keys = [chunk_key(cid) for cid in chunk_ids]
-            rel_deleted = self.delete_relations_for_keys(rel_keys)
-
-        counts: dict[str, int] = {"memory_relations": rel_deleted, "l3_chunks": 0}
+        counts: dict[str, int] = {"memory_relations": rel_deleted}
         with self._conn() as conn:
-            # 删除 L3 块和 FTS5 索引
-            for cid in chunk_ids:
-                conn.execute("DELETE FROM l3_chunks WHERE chunk_id=?", (cid,))
-                conn.execute("DELETE FROM l3_chunks_fts WHERE chunk_id=?", (cid,))
-                counts["l3_chunks"] += 1
-
-            # 删除所有关联的记忆表数据
-            for table in (
-                "episodic_memories",
-                "l0_core_memories",
-                "l3_recall_stats",
-            ):
-                cur = conn.execute(f"DELETE FROM {table} WHERE person_id=?", (pid,))
-                counts[table] = int(cur.rowcount)
+            # 删除统一记忆库（memory_items + FTS）
+            for mid in mi_ids:
+                conn.execute("DELETE FROM memory_items_fts WHERE id=?", (mid,))
+            cur = conn.execute("DELETE FROM memory_items WHERE person_id=?", (pid,))
+            counts["memory_items"] = int(cur.rowcount)
 
             # 删除画像
             cur = conn.execute("DELETE FROM person_profiles WHERE person_id=?", (pid,))

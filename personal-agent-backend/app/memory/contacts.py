@@ -1,10 +1,10 @@
 """
 第三方人物画像 —— 聊天中提到的亲友/熟人，与对话对象（owner）区分存储。
 
-识别策略（避免乱建 / 避免漏建）：
-  - 高置信（立刻建档/更新）：明确关系（「刘远航是我姐」）、明确事实（「刘远航在杭州实习」）
-  - 中置信（立刻建档）：用户主动问「你认识 XXX 吗」且本轮有描述
-  - 低置信（累计）：仅点名提及 → 先记 mention_count；达到阈值或出现事实后再建档
+识别策略（宁可漏建，不可误建）：
+  - 首次建档：只接受明确、具名的关系陈述（「刘远航是我姐」）
+  - 已有档案：可由明确的具名事实补充内容
+  - 单纯提问、随口提及、模糊断言：不创建候选、不写画像
 
 画像 scope：同一 owner_person_id（如女友 123）下的第三方互不混淆。
 """
@@ -40,6 +40,8 @@ logger = logging.getLogger(__name__)
 
 PROFILE_ROLE_OWNER = "owner"
 PROFILE_ROLE_CONTACT = "contact"
+ROBOT_OWNER_PERSON_ID = "robot:sparkbot"
+ROBOT_OWNER_DISPLAY_NAME = "叶鹏祥 / SparkBot"
 
 # 单独出现时不建档的泛称（无具体人名）
 _GENERIC_NAMES = frozenset({
@@ -104,7 +106,7 @@ class ContactSignal:
 
 
 def _clean_person_name(name: str) -> str:
-    return re.sub(r"\s+", "", (name or "").strip()).rstrip("了啦哈呢啊嘛吧")
+    return re.sub(r"\s+", "", (name or "").strip()).rstrip("了啦哈呢啊嘛吧吗？?！!。")
 
 
 def _normalize_name(name: str) -> str:
@@ -168,7 +170,12 @@ def find_contact_profile(
 
 def list_contacts_for_owner(device_id: str, owner_person_id: str) -> list[dict]:
     out: list[dict] = []
-    for row in store.list_person_profiles(device_id):
+    rows = (
+        store.list_all_person_profiles()
+        if str(owner_person_id or "").strip() == ROBOT_OWNER_PERSON_ID
+        else store.list_person_profiles(device_id)
+    )
+    for row in rows:
         p = normalize_profile(row["profile"])
         if not _is_contact_profile(p):
             continue
@@ -265,6 +272,23 @@ def _detect_signals(user_msg: str, *, exclude_names: set[str]) -> list[ContactSi
     return signals
 
 
+_FIRST_CONTACT_SOURCES = frozenset({"rel_to_user", "rel_user_has"})
+_CONTACT_UPDATE_SOURCES = _FIRST_CONTACT_SOURCES | frozenset({"fact_place", "fact_is"})
+
+
+def has_contact_admission_signal(user_msg: str) -> bool:
+    """本轮是否包含值得进入第三方画像管线的明确陈述。
+
+    这里只做轻量语法门控；真正的 owner 排除与是否允许首次建档由
+    ``process_third_party_from_turn`` 再次校验。询问某人或随口提到某人
+    从不构成写入理由。
+    """
+    return any(
+        signal.source in _CONTACT_UPDATE_SOURCES
+        for signal in _detect_signals(user_msg, exclude_names=set())
+    )
+
+
 def upsert_contact_from_signal(
     device_id: str,
     owner_person_id: str,
@@ -274,24 +298,24 @@ def upsert_contact_from_signal(
 ) -> tuple[dict | None, str]:
     """根据信号创建或更新第三方画像。返回 (profile, event_msg)。
 
-    如果提供了 resolution，会根据 resolution.source 做差异处理：
-      - "contact" → 仅更新提及次数（正常走 existing 路径）
-      - "wiki"    → 从 wiki 元数据创建 confirmed contact，不新建空档案
-      - "l3"      → 跳过，不创建画像，返回 ("skip")
-      - "unknown" → 正常按置信度创建
+    未知人物只有明确关系陈述可以首次建档。提问和随口提及不写入；
+    明确事实仅用于补充既有档案，避免把普通句子误识别为新人物。
     """
     from datetime import datetime, timezone
 
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
 
-    # ── L3 已知但不结构化 → 跳过 ──
-    if resolution and resolution.source == "l3":
+    # ── 长期记忆 已知但不结构化 → 跳过 ──
+    if resolution and resolution.source == "memory_items":
+        return None, ""
+
+    # 问句与随口提及没有持久化价值；此处再次守住直接调用本函数的路径。
+    if sig.source not in _CONTACT_UPDATE_SOURCES:
         return None, ""
 
     existing = find_contact_profile(device_id, owner_person_id, sig.name)
     mention_count = int((existing or {}).get("mention_count") or 0) + 1
-    threshold = max(1, int(getattr(settings, "contact_min_casual_mentions", 2)))
 
     # ── Wiki 已知 → 从 wiki 元数据创建/补全为 confirmed contact ──
     if resolution and resolution.source == "wiki" and not existing:
@@ -308,12 +332,8 @@ def upsert_contact_from_signal(
         existing = None  # 不进入 "更新" 分支
     elif existing:
         profile = normalize_profile(existing)
-    elif sig.confidence == "high":
+    elif sig.source in _FIRST_CONTACT_SOURCES:
         profile = _empty_contact(device_id, owner_person_id, sig.name, relationship=sig.relationship)
-    elif sig.confidence == "medium":
-        profile = _empty_contact(device_id, owner_person_id, sig.name, relationship=sig.relationship)
-    elif sig.confidence == "low":
-        profile = _empty_contact(device_id, owner_person_id, sig.name)
     else:
         return None, ""
 
@@ -325,11 +345,7 @@ def upsert_contact_from_signal(
     if sig.note:
         _append_unique(profile.setdefault("notes", []), [sig.note])
 
-    if sig.confidence == "high" or (sig.relationship or sig.note):
-        profile["confirmed"] = True
-    elif mention_count >= threshold and (
-        profile.get("relationship") or profile.get("notes") or profile.get("experiences")
-    ):
+    if sig.source in _FIRST_CONTACT_SOURCES or (sig.relationship or sig.note):
         profile["confirmed"] = True
     else:
         profile["confirmed"] = bool(profile.get("confirmed"))
@@ -352,8 +368,6 @@ def upsert_contact_from_signal(
             logger.info("contact mention: %s owner=%s", nick, owner_person_id[:8])
             return profile, f"第三方画像命中 · {nick}"
 
-    if not profile.get("confirmed") and sig.confidence == "low":
-        return profile, f"第三方提及 · {nick}（{mention_count}/{threshold}）"
     logger.info("contact %s: %s owner=%s", action, nick, owner_person_id[:8])
     return profile, f"第三方画像{action} · {nick}"
 
@@ -415,12 +429,8 @@ def process_third_party_from_turn(
 ) -> list[str]:
     """处理一轮对话中的第三方人物信号，返回 monitor 事件文案列表。
 
-    增强点（集成 person_resolver）：
-      - 先通过 resolve_person 判断每个人名的认知来源
-      - contact 已知 → 仅命中，不新建
-      - Wiki 已知 → 自动同步为 contact，标注"Wiki人物同步"
-      - L3 已知但不结构化 → 跳过，不创建画像
-      - 未知 → 按正常置信度策略创建
+    首次建档仅限明确关系；已确认联系人可接受明确事实补充。任何问句
+    或随口提及都不会留下持久化候选，避免污染 ``person_profiles``。
     """
     pid = str(owner_person_id or "").strip()
     if not pid or pid.startswith("tmp_"):
@@ -450,8 +460,8 @@ def process_third_party_from_turn(
         key = _normalize_name(sig.name)
         resolution = resolutions.get(key)
 
-        # L3 已知但不结构化 → 跳过，不创建 contact
-        if resolution and resolution.source == "l3":
+        # 长期记忆 已知但不结构化 → 跳过，不创建 contact
+        if resolution and resolution.source == "memory_items":
             continue
 
         prof, ev = upsert_contact_from_signal(
@@ -517,6 +527,12 @@ def format_contacts_prompt_block(
     if not pid or pid.startswith("tmp_"):
         return ""
     contacts = list_contacts_for_owner(device_id, pid)
+    robot_contacts = list_contacts_for_owner(device_id, ROBOT_OWNER_PERSON_ID)
+    known_ids = {str(p.get("person_id") or "") for p in contacts}
+    contacts.extend(
+        p for p in robot_contacts
+        if str(p.get("person_id") or "") not in known_ids
+    )
     exclude = _owner_names(owner_profile, pid)
     relevant = contacts_mentioned_in_message(user_message, contacts, exclude_names=exclude)
     if not relevant:
@@ -544,12 +560,14 @@ def format_contacts_prompt_block(
 
     lines = [
         "## 第三方人物（对话对象提到的人 · 只许用下列档案，禁止编造）",
-        f"（以下人物与当前对话对象 {profile_display_name(owner_profile) if owner_profile else pid} 相关，不是对话对象本人）",
+        f"（以下人物与当前对话对象 {profile_display_name(owner_profile) if owner_profile else pid} 或智能体本人相关，不是对话对象本人）",
     ]
     for p in relevant[:4]:
         name = profile_display_name(p)
         rel = profile_relationship(p)
-        rel_line = f"与对话对象关系：{rel}" if rel else "关系：未明"
+        owner_id = str(p.get("owner_person_id") or "")
+        owner_label = "智能体本人" if owner_id == ROBOT_OWNER_PERSON_ID else "对话对象"
+        rel_line = f"与{owner_label}关系：{rel}" if rel else f"与{owner_label}关系：未明"
         parts = [f"【{name}】{rel_line}"]
         if p.get("notes"):
             parts.append("备注：" + "；".join(str(x) for x in p["notes"][:4]))

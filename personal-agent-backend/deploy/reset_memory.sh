@@ -1,5 +1,5 @@
 #!/bin/bash
-# 清空服务端所有对话/记忆缓存（L1/L2/L3/facts），保留 .env
+# 清空服务端会话、统一记忆库与状态数据，保留 .env
 # 用法: bash /opt/sparkbot/personal-agent-backend/deploy/reset_memory.sh
 set -e
 

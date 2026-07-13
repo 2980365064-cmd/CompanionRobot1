@@ -12,7 +12,12 @@ import re
 from dataclasses import dataclass
 
 from app.config import settings
-from app.memory.identity import memory_scoped_to_person
+from app.memory.identity import (
+    is_temp_person_id,
+    memory_scoped_to_person,
+    new_temp_person_id,
+    resolve_identity_turn,
+)
 from app.memory.profile import find_profile_by_name, normalize_profile
 from app.session import store
 
@@ -70,7 +75,6 @@ def ensure_session_defaults(device_id: str, session_id: str) -> None:
     if mode == MODE_GIRLFRIEND and owner_id:
         if not active or str(active).startswith("tmp_"):
             store.set_session_active_person(session_id, owner_id)
-    store.clear_session_identity_pending(session_id)
 
 
 def _detect_mode_switch(message: str) -> str | None:
@@ -121,18 +125,26 @@ def resolve_interlocutor_before_memory(
     switch = _detect_mode_switch(message)
     if switch:
         store.set_session_interlocutor_mode(session_id, switch)
+        person_id = ""
+        profile = None
         if switch == MODE_GIRLFRIEND:
             owner_id = get_default_owner_person_id(device_id)
             if owner_id:
                 store.set_session_active_person(session_id, owner_id)
+            person_id = _active_person_id(device_id, session_id)
+            profile = _load_active_profile(device_id, session_id)
+        else:
+            # 访客角色必须脱离已实名对象，避免把主人的记忆带入访客 prompt。
+            person_id = new_temp_person_id()
+            store.set_session_active_person(session_id, person_id)
         store.clear_session_identity_pending(session_id)
         ack = MODE_ACK[switch]
         label = "访客模式" if switch == MODE_VISITOR else "女友模式"
         return InterlocutorTurnResult(
-            person_id=_active_person_id(device_id, session_id),
-            person_profile=_load_active_profile(device_id, session_id),
+            person_id=person_id,
+            person_profile=profile,
             hint=_mode_switch_hint(switch),
-            guest_mode=False,
+            guest_mode=switch == MODE_VISITOR,
             monitor_event=f"模式切换 · {label}",
             interlocutor_mode=switch,
             mode_switched=True,
@@ -140,37 +152,40 @@ def resolve_interlocutor_before_memory(
         )
 
     mode = store.get_session_interlocutor_mode(session_id) or MODE_GIRLFRIEND
-    person_id = _active_person_id(device_id, session_id)
-    profile = _load_active_profile(device_id, session_id)
+    identity = resolve_identity_turn(device_id, session_id, message)
+    person_id = identity.person_id
+    profile = identity.person_profile or _load_active_profile(device_id, session_id)
     scoped = memory_scoped_to_person(person_id)
 
     if mode == MODE_VISITOR:
         return InterlocutorTurnResult(
             person_id=person_id,
             person_profile=profile,
-            hint=(
+            hint=identity.hint or (
                 "【对话角色 · 访客/朋友】叶鹏祥第一人称，大大咧咧、随性自然，"
                 "像跟兄弟/熟人微信闲聊；禁止情侣亲密语气与女友专属称呼（大炮/秋雨/乖乖等）。"
             ),
-            guest_mode=not scoped,
+            guest_mode=identity.guest_mode or not scoped,
+            monitor_event=identity.monitor_event,
             interlocutor_mode=MODE_VISITOR,
         )
 
     return InterlocutorTurnResult(
         person_id=person_id,
         person_profile=profile,
-        hint=(
+        hint=identity.hint or (
             "【对话角色 · 女友刘远慧】深情、走心，会逗她损她一下（损友+情人）；"
             "按 persona 场景路由选风格，勿混斗嘴/走心/哲理。"
         ),
-        guest_mode=not scoped,
+        guest_mode=identity.guest_mode or not scoped,
+        monitor_event=identity.monitor_event,
         interlocutor_mode=MODE_GIRLFRIEND,
     )
 
 
 def _active_person_id(device_id: str, session_id: str) -> str:
     pid = store.get_session_active_person_id(session_id) or ""
-    if pid and not str(pid).startswith("tmp_"):
+    if pid:
         return pid
     owner_id = get_default_owner_person_id(device_id)
     if owner_id:
@@ -181,7 +196,7 @@ def _active_person_id(device_id: str, session_id: str) -> str:
 
 def _load_active_profile(device_id: str, session_id: str) -> dict | None:
     pid = _active_person_id(device_id, session_id)
-    if not pid:
+    if not pid or is_temp_person_id(pid):
         return None
     prof = store.get_person_profile(pid)
     if prof:

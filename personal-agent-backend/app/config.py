@@ -12,7 +12,7 @@
   2. Embedding 配置（阿里云 DashScope）
   3. 安全配置（API Token）
   4. 路径配置（persona 语料/持久化）
-  5. 记忆分层参数（L0/L1/L2/L3）
+  5. 记忆参数（工作上下文 / 近期记忆 / 长期记忆）
   6. 画像参数（临时画像转正/归档）
   7. 运行时参数（端口、温度等）
 """
@@ -79,7 +79,7 @@ class Settings(BaseSettings):
     profile_card_path: str = "../persona/config/profile_card.md"
     # 风格目录（包含语气、口癖等 style 描述）
     style_dir: str = "../persona/style"
-    # 语料目录（包含长期知识 .md 文件，启动时自动入库到 L3 Corpus）
+    # 语料目录（包含长期知识 .md 文件，启动时自动入库到长期记忆）
     corpus_dir: str = "../persona/corpus"
 
     # ============================
@@ -87,98 +87,80 @@ class Settings(BaseSettings):
     # ============================
     # ChromaDB 向量数据存储路径（search_backend=chroma 时使用）
     chroma_path: str = "./chroma_data"
-    # SQLite 数据库路径（存储会话、消息、画像、L0/L2/L3/Facts 等）
+    # SQLite 数据库路径（存储会话、消息、画像、核心事实、近期记忆、长期记忆等）
     db_path: str = "./agent.db"
 
     # ============================
     # 搜索后端配置
     # ============================
-    # L3 检索后端：sqlite（推荐，2G 机器友好）或 es（Elasticsearch，数据量大时推荐）
+    # 长期记忆检索后端：sqlite（推荐，2G 机器友好）或 es（Elasticsearch，数据量大时推荐）
     search_backend: str = "sqlite"
     # Elasticsearch 连接配置（search_backend=es 时生效）
-    # ES 用于 L3 长期记忆的混合检索（全文+向量），替代默认的 SQLite FTS
+    # ES 用于长期记忆的混合检索（全文+向量），替代默认的 SQLite FTS
     es_url: str = "http://127.0.0.1:9200"
     es_api_key: str = ""                  # API Key 认证（与 username/password 二选一）
     es_username: str = ""                 # 用户名认证
     es_password: str = ""                 # 密码认证
-    es_index_prefix: str = "sparkbot"     # 索引名前缀，生成 sparkbot_l3 等索引名
+    es_index_prefix: str = "sparkbot"     # 索引名前缀，生成 sparkbot_long_term 等索引名
     es_timeout_sec: int = 8               # 请求超时（秒）
     es_keyword_candidates: int = 32       # 关键词搜索候选数（第一阶段粗排，bigram 需更多候选）
     es_vector_candidates: int = 32        # 向量搜索候选数（第一阶段粗排）
     es_rerank_top_n: int = 16             # 重排序后最终保留条数（第二阶段精排）
     es_min_recall_score: float = 0.35     # 最低召回相似度阈值（修复 RRF 后不再有虚假加分）
 
-    # ============================
-    # 记忆分层参数
-    # ============================
-    # L1（工作记忆/Working Memory）：
-    #   L1 是本会话的消息滑动窗口，存储在 SQLite messages 表中。
-    #   working_memory_turns 轮对话后触发 compress（L1→L2），
-    #   每次压缩 l1_compress_batch_turns 轮（最老的几轮），不是全部压缩，
-    #   保留最近消息在 L1 中继续使用，避免对话中间突然丢光上下文。
-    #   阈值从 20 提高到 30、批次从 12 提高到 18：减少中途 LLM 压缩调用次数。
-    working_memory_turns: int = 30        # 何时开始压缩（轮数阈值）
-    l1_compress_batch_turns: int = 18     # 每批压缩几轮
 
-    # L2（情景记忆/Episodic Memory）：
-    #   最近 l2_retention_days 天的会话摘要，向量检索注入 prompt
-    #   到期后由 l2_rollup_sweeper 归档到 L3 Corpus
-    l2_retention_days: int = 14           # L2 保留天数（从 7→14，支持情感近况更长感知）
-    l2_recall_recent: int = 3            # 时间倒序召回条数
-    l2_recall_query_k: int = 2           # 向量语义召回条数
-    l2_embed_pool: int = 15              # 向量嵌入池大小（最近 N 条摘要参与向量检索）
-    l2_sim_threshold: float = 0.6        # L2 向量相似度最低阈值
-    l3_sim_threshold: float = 0.55         # L3 向量相似度最低阈值（低于此视为未命中，禁止编造）
-    episodic_top_k: int = 3              # 注入 prompt 的 L2 摘要条数
-    rag_top_k: int = 5                   # RAG 检索条数（备用）
+    # ============================
+    # 当前会话上下文（Working Context）
+    # ============================
+    # 上下文压缩触发阈值（轮数）
+    working_context_turns: int = 30
+    # 每批压缩轮数
+    context_compaction_batch_turns: int = 18
 
-    # L3（长期记忆/Corpus + Facts）：
-    #   用户聊天记忆和语料库的向量化存储，支持全文+向量混合检索
-    l3_denoise_enabled: bool = True       # 入库时启用去噪（过滤低质量文本）
-    # import_wechat 已生成叙述性月度总结时，默认 ingest；留空表示不跳过任何 corpus 文件
-    l3_noise_file_patterns: str = ""
-    # L3 检索模式：
-    #   always = 每轮都检索（person_id 绑定后，原行为）
-    #   auto  = 快路径仅 L0+L1+最近 L2，首轮到回复前不等待 L3；
-    #           L3 仅当用户问明确需要记忆的问题时阻塞等待，
-    #           其余情况异步后补（目前仍同步等待，二期改为真正异步）
-    #   never = 完全跳过 L3 检索（仅 L0+L1+L2）
-    l3_recall_mode: str = "auto"
-    # 是否自动从对话中提取 Facts（默认关闭，由 extractor 模组按需触发）
-    auto_extract_facts: bool = False
+    # ============================
+    # 近期记忆（Recent Memory）
+    # ============================
+    # 近期记忆保留天数
+    recent_memory_retention_days: int = 14
+    # 时间倒序召回条数
+    recent_memory_recall_recent: int = 3
+    # 向量嵌入池大小
+    recent_memory_embed_pool: int = 15
+    # 向量相似度最低阈值
+    recent_memory_sim_threshold: float = 0.6
+    # 注入 prompt 条数
+    recent_memory_top_k: int = 3
+
+    # ============================
+    # 长期记忆（Long-Term Memory）
+    # ============================
+    # 向量相似度最低阈值
+    long_term_memory_sim_threshold: float = 0.55
+    # 入库去噪
+    long_term_memory_denoise_enabled: bool = True
+    # 噪音文件模式
+    long_term_memory_noise_file_patterns: str = ""
+    # RAG 检索条数
+    rag_top_k: int = 5
 
     # ============================
     # 画像（Profile）参数
     # ============================
     # 临时画像是否自动更新
     person_profile_auto_update: bool = False
-    # 画像履历归档间隔（小时）：每 N 小时扫描 L2+L3，更新性格/履历描述
+    # 画像履历归档间隔（小时）：每 N 小时扫描近期/长期记忆，更新性格/履历描述
     profile_batch_interval_hours: int = 3
-    # 归档回溯窗口（小时）：只取最近 N 小时内的 L2/L3 内容
+    # 归档回溯窗口（小时）：只取最近 N 小时内的近期/长期记忆内容
     profile_batch_lookback_hours: int = 3
     # 临时画像转正模式：any=任一规则满足即转正，all=全部规则满足才转正
     profile_promotion_mode: str = "any"
     # 临时画像转正规则列表（逗号分隔），详见 memory/pipeline/promotion.py
     profile_promotion_rules: str = (
-        "relationship_declared,substantive_fact,l2_episode,"
+        "relationship_declared,substantive_fact,recent_episode,"
         "profile_long_memory,user_remember_intent"
     )
     # 记忆自动修正：用户说"不对/不是/记错了"时触发 LLM 纠错
     memory_auto_correct: bool = True
-
-    # ============================
-    # L0（核心记忆/Core Memory）参数
-    # ============================
-    # L0 提取方式：会话结束时由 LLM 从 L2 摘要中提取（非阻塞）
-    # 实时提取：用户明确声明时即时写入（如"我今年25岁"）
-    #
-    # 以下三个配置项已废弃（v2.0 前使用每日批量 P3→L0 升级，现已移除）：
-    l0_batch_min_recall: int = 3           # [废弃] 保留仅为旧配置兼容
-    l0_batch_min_confidence: float = 1.0   # [废弃] 保留仅为旧配置兼容
-    l0_batch_hour: int = 0                 # [废弃] 保留仅为旧配置兼容
-
-    # L0 即时升级置信度阈值（用户明确声明时直接写入 L0 的门槛）
-    l0_promote_min_confidence: float = 0.95
 
     # ============================
     # 访客与身份识别参数
@@ -189,9 +171,6 @@ class Settings(BaseSettings):
     # 默认对话对象（开机/新会话默认女友模式）
     default_owner_person_id: str = ""
     default_owner_display_name: str = "刘远慧"
-    # 第三方人物：随口提及至少 N 次后才 confirmed（高置信关系/事实仍立即确认）
-    contact_min_casual_mentions: int = 2
-
     # ============================
     # 记忆关联图参数
     # ============================
@@ -201,7 +180,7 @@ class Settings(BaseSettings):
     # ============================
     # Persona 语料导入参数
     # ============================
-    # 启动时是否自动同步 persona/corpus/ 到 L3
+    # 启动时是否自动同步 persona/corpus/ 到长期记忆
     persona_ingest_on_startup: bool = True
     # 启动时是否全量重建语料索引（true=每次重启都清空重建，很慢，仅维护用）
     persona_ingest_reset_on_startup: bool = False

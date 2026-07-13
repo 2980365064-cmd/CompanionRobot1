@@ -4,15 +4,15 @@
 ============================================================================
 在陪伴型情感机器人记忆体系中的角色：
   Profile 是"人物履历层"——存储性格、关键经历、情绪规律等深度画像数据。
-  与 L0（核心事实）分工明确，不重复存储：
+  与 核心事实（核心事实）分工明确，不重复存储：
 
   对比：
-    L0（核心事实层）     → 身份、禁忌、核心关系、纪念日、强偏好（每轮必载）
+    核心事实（核心事实层）     → 身份、禁忌、核心关系、纪念日、强偏好（每轮必载）
     Profile（人物履历层） → 性格/沟通特征、重要经历、情绪规律（低频深度谈心时启用）
 
 画像生命周期：
   draft（临时） → 积累实质内容 → 确认转正（confirmed=True）
-  转正时触发 sync_l0_from_profile 将身份/关系同步到 L0
+  转正时触发 sync_core_from_profile 将身份/关系同步到 核心事实
 
 设计简化（相比老版 person_profile.py + pipeline/promotion.py）：
   - 取消了多版本号（v1/v2/v3/draft），confirmed 标志替代 provisional/v1
@@ -263,7 +263,7 @@ def try_promote_provisional_profile(
     转正条件：画像有实质内容（has_profile_substance 为 True）。
     转正后：
       1. confirmed 设为 True
-      2. 触发 sync_l0_from_profile 将身份/关系同步到 L0
+      2. 触发 sync_core_from_profile 将身份/关系同步到 核心事实
       3. 生成确认日志
 
     Args:
@@ -282,15 +282,15 @@ def try_promote_provisional_profile(
     if p.get("confirmed"):
         return p, "already confirmed"
 
-    from app.memory.l0 import sync_l0_from_profile
+    from app.memory.core_facts import sync_core_facts_from_profile
 
     if has_profile_substance(p):
         # 确认转正：标记 confirmed，更新时间戳，写入存储
         p["confirmed"] = True
         p["updated_at"] = _utc_now()
         store.save_person_profile(device_id, p)
-        # 转正后同步身份/关系到 L0 核心事实
-        sync_l0_from_profile(device_id, person_id, p)
+        # 转正后同步身份/关系到 核心事实 核心事实
+        sync_core_facts_from_profile(device_id, person_id, p)
         nick = profile_display_name(p)
         logger.info("profile confirmed: %s", nick)
         return p, f"画像确认 · {nick}"
@@ -306,7 +306,7 @@ def format_provisional_person_block(profile: dict | None) -> str:
     """生成访客模式下的提示块：告知 LLM 当前对话对象未确认身份。
 
     访客模式下，LLM 必须以"不认识"的态度交流，禁止假装老熟人寒暄。
-    身份和关系信息以 L0 为准（访客没有 L0，所以是空的）。
+    身份和关系信息以 核心事实 为准（访客没有 核心事实，所以是空的）。
 
     Args:
         profile: 临时画像（可能为 None）
@@ -317,21 +317,21 @@ def format_provisional_person_block(profile: dict | None) -> str:
     if not profile:
         return (
             "## 当前对话对象\n"
-            "（尚未确认对方是谁；身份与关系以 L0 为准，勿擅自假定）"
+            "（尚未确认对方是谁；身份与关系以 核心事实 为准，勿擅自假定）"
         )
     name = str(profile.get("claimed_name") or profile_display_name(profile) or "对方")
     return f"""## 当前对话对象（仅本轮自称，记忆库无此人记录）
 
-用户自称「{name}」；L2/L3/L0 中**此前均无此人**完整记录。
+用户自称「{name}」；近期记忆/长期记忆/核心事实 中**此前均无此人**完整记录。
 - **禁止**假装认识、老熟人寒暄
-- 身份/关系/喜恶以 L0 为准；无则可口语追问"""
+- 身份/关系/喜恶以 核心事实 为准；无则可口语追问"""
 
 
 def has_profile_archive_content(profile: dict | None) -> bool:
     """判断画像是否包含归档级别内容（性格/经历/情绪规律）。
 
     仅在画像已确认且至少有一项归档字段非空时返回 True。
-    归档内容用于深度谈心场景，不同于 L0 的日常核心事实。
+    归档内容用于深度谈心场景，不同于 核心事实 的日常核心事实。
     """
     if not profile:
         return False
@@ -376,7 +376,7 @@ def format_profile_archive_query_block(
     """当用户询问人生经历/性格等深度问题时，注入画像履历归档块。
 
     触发条件：user_message 包含"我的经历/成长经历/人生故事"等关键词。
-    仅深度谈心场景启用，日常对话不注入（日常以 L0 为准）。
+    仅深度谈心场景启用，日常对话不注入（日常以 核心事实 为准）。
 
     Args:
         user_message:   用户当前消息
@@ -415,11 +415,11 @@ def format_profile_archive_query_block(
     body = "\n".join(x for x in parts if x)
     if not body:
         return ""
-    return f"""## 人物履历归档（低频；仅深度谈心/聊自身经历时启用；基础事实以 L0 为准）
+    return f"""## 人物履历归档（低频；仅深度谈心/聊自身经历时启用；基础事实以 核心事实 为准）
 
 {body}
 
-- 日常身份/喜恶/禁忌/纪念日 → 只用 L0，勿与归档混用
+- 日常身份/喜恶/禁忌/纪念日 → 只用 核心事实，勿与归档混用
 - 只许使用上述归档内容，禁止编造成长经历"""
 
 
@@ -427,7 +427,7 @@ def format_profile_archive_query_block(
 # 周期性画像更新 —— LLM 驱动的按需更新
 # ══════════════════════════════════════════════════════════════════════════════
 
-# LLM 提示词：根据近期的 L2 摘要和 L3 长期记忆，更新画像的性格/经历/情绪规律
+# LLM 提示词：根据近期的近期记忆和长期记忆，更新画像的性格/经历/情绪规律
 # 仅新增不删除，避免丢失已确认内容
 _PROFILE_UPDATE_PROMPT = """你是人物履历归档器。根据记忆材料更新性格/经历/情绪规律（仅新增，不删除已有）。
 
@@ -435,11 +435,11 @@ _PROFILE_UPDATE_PROMPT = """你是人物履历归档器。根据记忆材料更�
 当前归档：
 {current}
 
-材料 — L2 摘要：
-{l2_text}
+材料 — 近期记忆：
+{recent_memory_text}
 
-材料 — L3 长期记忆：
-{l3_text}
+材料 — 长期记忆：
+{long_term_memory_text}
 
 只输出 JSON：
 {{"need_update": true/false, "reason": "一句话",
@@ -447,7 +447,7 @@ _PROFILE_UPDATE_PROMPT = """你是人物履历归档器。根据记忆材料更�
 
 
 def update_profile(device_id: str, person_id: str) -> dict | None:
-    """对单一用户的画像做增量更新：用 LLM 分析近期 L2+L3 材料，提取新的归档条目。
+    """对单一用户的画像做增量更新：用 LLM 分析近期记忆和长期记忆材料，提取新的归档条目。
 
     更新策略：仅新增（append only），不删除已有内容。LLM 判断是否需要更新，
     返回 need_update=true 时执行 patch 合并。
@@ -469,13 +469,14 @@ def update_profile(device_id: str, person_id: str) -> dict | None:
     if not profile.get("confirmed"):
         return None
 
-    # 取最近 3 天内的 L2 摘要和 L3 长期记忆作为分析材料
+    # 取最近 3 天内的近期记忆和长期记忆作为分析材料
     since = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
-    l2 = store.list_episodic_since(person_id, since, limit=15)
-    l3_rows = store.l3_list_person_memory(person_id, limit=30)
-    l3_texts = [str(r.get("text", "")).strip() for r in l3_rows if str(r.get("text", "")).strip()][:20]
+    recent_rows = store.list_recent_memory_since(person_id, since, limit=15)
+    long_term_rows = store.list_person_long_term_memory(person_id, limit=30)
+    recent_texts = [str(r.get("summary", "") or r.get("content", "")).strip() for r in recent_rows if str(r.get("summary", "") or r.get("content", "")).strip()]
+    long_term_texts = [str(r.get("text", "")).strip() for r in long_term_rows if str(r.get("text", "")).strip()][:20]
 
-    if not l2 and not l3_texts:
+    if not recent_texts and not long_term_texts:
         return None
 
     name = profile_display_name(profile)
@@ -487,8 +488,8 @@ def update_profile(device_id: str, person_id: str) -> dict | None:
     prompt = _PROFILE_UPDATE_PROMPT.format(
         name=name,
         current=json.dumps(current, ensure_ascii=False),
-        l2_text=json.dumps([str(r.get("summary", "")) for r in l2 if r.get("summary")], ensure_ascii=False),
-        l3_text=json.dumps(l3_texts, ensure_ascii=False),
+        recent_memory_text=json.dumps(recent_texts[:15], ensure_ascii=False),
+        long_term_memory_text=json.dumps(long_term_texts, ensure_ascii=False),
     )
 
     raw_out = chat_completion_small([{"role": "user", "content": prompt}])

@@ -311,7 +311,7 @@ def _style_principles_to_card(style: str) -> str:
 
 def build_profile_card_full(*, example_limit: int = 20) -> str:
     """从 persona.md 全文 + style 原则生成 Profile Card（尽量完整，不丢章节）。"""
-    del example_limit  # 保留参数兼容旧调用；不再注入问→答范例
+    del example_limit
     persona = load_persona_raw()
     style = load_style_examples()
     parts: list[str] = [
@@ -326,7 +326,7 @@ def build_profile_card_full(*, example_limit: int = 20) -> str:
 
 
 def build_profile_card_deterministic(*, example_limit: int = 8) -> str:
-    """从 persona.md + style 结构化抽取（旧版，内容可能不全；请用 build_profile_card_full）。"""
+    """从 persona.md 与 style 结构化抽取 Profile Card。"""
     persona = load_persona_raw()
     style = load_style_examples()
     sections = _parse_persona_sections(persona)

@@ -21,11 +21,11 @@ source venv/bin/activate
 # 启动（推荐方式——仅显示 Agent 监控日志）
 python -m app.main
 
-# 或直接 uvicorn（开发时可用 --reload）
-uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
+    # 或直接 uvicorn（开发时可用 --reload）
+    uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
 
 # 语料管理
-python scripts/ingest.py             # 增量入库 persona/corpus/ → L3
+python scripts/ingest.py             # 增量入库 persona/corpus/ → 长期记忆
 python scripts/ingest.py --reset     # 全量重建语料索引
 python scripts/compress_profile.py   # 生成/更新 profile_card.md
 
@@ -57,36 +57,30 @@ docker compose up -d --build
 
 ```
 用户消息 → get_or_create_session → resolve_interlocutor_before_memory（身份门控）
-→ memory_router.recall（L0全量+L2向量+L3混合检索+关联扩展）
+→ memory_router.recall（核心事实+近期向量+长期混合检索+关联扩展）
 → load_profile_card（加载机器人人格）
 → build_messages（拼装 system prompt）
 → chat_completion_async（DeepSeek 单次调用，||| 分隔主回复和主动话题）
-→ _parse_reply → 校验/截断 → 写入 L1 → 异步入库
+→ _parse_reply → 校验/截断 → 写入工作上下文 → 异步入库
 ```
 
 关键文件：`app/agent.py:696 handle_chat()` 是主入口，`build_messages()` 是 prompt 组装核心。
 
-### 记忆分层体系
+### 记忆体系（统一语义化）
 
-| 层 | 存储 | 注入方式 | 模块 |
+| 类别 | 存储 | 注入方式 | 模块 |
 |---|---|---|---|
-| **L0 Core** | `l0_core_memories` 表 | 全量注入每轮 system prompt | `memory/l0.py` |
-| **L1 Working** | `messages` 表（本会话窗口） | 最近 N 轮拼入 messages | `memory/l1.py` |
-| **L2 Episodic** | `episodic_memories` 表 | 向量检索后注入，14天过期归档（含重要性加权） | `memory/l2.py` |
-| **L3 Corpus** | `l3_chunks` + FTS5 | 混合检索（向量+全文），永久存储 | `memory/l3.py` |
-| **Profile** | `person_profiles` 表（JSON） | 格式化后注入 prompt | `memory/profile.py` |
+| **核心事实** | 统一记忆库 `memory_items`（visibility=always） | 全量注入每轮 system prompt | `memory/core_facts.py` |
+| **工作上下文** | `messages` 表（本会话窗口） | 最近 N 轮拼入 messages | `memory/working_context.py` |
+| **近期记忆** | 统一记忆库 `memory_items`（kind=episode/emotion） | 向量检索后注入，14天过期归档（含重要性加权） | `memory/recent_memory.py` |
+| **长期记忆** | 统一记忆库 `memory_items`（FTS5 + 向量混合检索） | 混合检索（向量+全文），永久存储 | `memory/unified_store.py` |
+| **画像** | `person_profiles` 表（JSON） | 格式化后注入 prompt | `memory/profile.py` |
 
-> **2026-07-02 重构：L2 保留期从 7→14 天，增加 importance(1-5) 和 people 字段。高重要性事件(>=4)不受过期限制。**
-
-**记忆流转**：L1(本轮) → L1压缩→ L2(14天摘要，高重要性永久) → 到期归档→ L3(永久) → 高频提升→ L0
-| **L3 Corpus** | `l3_chunks` + FTS5 | 混合检索（向量+全文），永久存储 | `memory/l3.py` |
-| **Profile** | `person_profiles` 表（JSON） | 格式化后注入 prompt | `memory/profile.py` |
-
-**记忆流转**：L1(本轮) → L1压缩→ L2(7天摘要) → 过期归档→ L3(永久) → 高频提升→ L0
+**记忆流转**：工作上下文 → 压缩→ 统一记忆库
 
 ### 身份门控 (`memory/identity.py`, `memory/interlocutor.py`)
 
-- **访客模式**（`tmp_*` person_id 或 `MODE_VISITOR`）：仅 L1，禁止访问 L0/L2/L3。每 N 轮口语提醒实名
+- **访客模式**（`tmp_*` person_id 或 `MODE_VISITOR`）：仅工作上下文，禁止访问核心事实/近期/长期记忆。每 N 轮口语提醒实名
 - **已实名模式**（verified person_id）：全量记忆注入
 - 口语实名格式：`名字 ID`（如"刘远慧 123"），由 `parse_identity_credentials()` 解析
 - 对话角色切换：用户说"访客模式"/"女友模式"触发 `resolve_interlocutor_before_memory()`
@@ -95,7 +89,9 @@ docker compose up -d --build
 
 单文件 SQLite `agent.db`，WAL 模式，8MB 缓存。全局单例 `store = SessionStore()`。所有 DB 操作是同步的，调用方通过 `asyncio.to_thread()` 在后台线程执行。
 
-核心表：`sessions`, `messages`, `episodic_memories`, `l3_chunks` + `l3_chunks_fts`(FTS5), `l0_core_memories`, `person_profiles`, `memory_relations`, `l3_recall_stats`
+核心表：`sessions`, `messages`, `memory_items` + `memory_items_fts`（统一记忆库，FTS5）, `person_profiles`, `memory_relations`, `open_loops`, `relationship_states`
+
+旧分层记忆表已通过一次性迁移删除，所有记忆统一存于 `memory_items`。
 
 Schema 迁移是增量的：各 `_migrate_*` 方法检测列是否存在再 ALTER TABLE，不需要手动迁移。
 
@@ -120,8 +116,8 @@ pydantic-settings 自动加载 `.env`，全局单例 `settings`。所有路径�
 ### 后台定时任务 (在 `app/main.py` lifespan 中启动)
 
 - `idle_session_sweeper` — 每分钟清理空闲超时会话
-- `l2_rollup_sweeper` — 每小时归档过期 L2 → L3
-- `profile_batch_sweeper` — 每 N 小时从 L2+L3 增量更新人物画像
+- `recent_memory_rollup_sweeper` — 每小时归档过期近期记忆 → 长期记忆
+- `profile_batch_sweeper` — 每 N 小时从近期+长期记忆增量更新人物画像
 
 ### 控制台监控 (`app/monitor.py`)
 
@@ -159,18 +155,18 @@ CONSOLE_LOG_WIDTH=100
 | `app/ws_handler.py` | WebSocket 协议处理（hello/chat/session_end 等） |
 | `app/monitor.py` | 控制台监控输出（记忆命中、耗时、后台事件） |
 | `app/tts.py` | 百度 TTS 语音合成 + 声音复刻 |
-| `app/memory/router.py` | MemoryRouter 记忆召回调度中心（底层） |
-| `app/memory/schema.py` | **记忆统一语义层** — MemoryItem/MemoryKind/MemoryPackV2 等核心数据结构，所有新模块基于此 schema |
-| `app/memory/orchestrator.py` | **Memory Orchestrator — 记忆编排器**，将 L0/L2/L3 统一转换为 MemoryPack（5 类产品记忆），支持 V2 转换 |
-| `app/memory/relationship_state.py` | **关系状态持久化** — 每轮更新关系温度/情绪趋势/态度/关心点/避雷点 |
-| `app/memory/open_loops.py` | **结构化 Open Loop 管理器** — 待办事项检测/创建/解决/冷却，替代 L2 硬解析 |
-| `app/memory/emotional_events.py` | **情感事件抽取器** — 从 L2 和对话中提取高重要性情感事件 |
-| `app/memory/l0.py` | L0 核心记忆提取与格式化 |
-| `app/memory/l1.py` | L1 工作记忆（消息滑动窗口） |
-| `app/memory/l2.py` | L2 情景记忆向量检索 |
-| `app/memory/l3.py` | L3 长期记忆混合检索（FTS5 + 向量） |
+| `app/memory/router.py` | MemoryRouter 记忆召回调度中心 |
+| `app/memory/schema.py` | **记忆统一语义层** — MemoryItem/MemoryKind/MemoryPackV2 等核心数据结构 |
+| `app/memory/orchestrator.py` | **Memory Orchestrator — 记忆编排器**，将核心事实/近期/长期记忆统一转换为 MemoryPack |
+| `app/memory/relationship_state.py` | **关系状态持久化** — 每轮更新关系温度/情绪趋势/态度 |
+| `app/memory/open_loops.py` | **结构化 Open Loop 管理器** |
+| `app/memory/emotional_events.py` | **情感事件抽取器** |
+| `app/memory/core_facts.py` | 核心事实提取与格式化 |
+| `app/memory/working_context.py` | 工作上下文（消息滑动窗口） |
+| `app/memory/recent_memory.py` | 近期记忆向量检索 |
+| `app/memory/long_term_memory.py` | 长期记忆混合检索（FTS5 + 向量） |
 | `app/memory/guard.py` | 反幻觉规则、主动话题校验、用户意图识别 |
-| `app/memory/extractor.py` | L1→L2 压缩、Facts 提取、过期 L2 归档 |
+| `app/memory/memory_pipeline.py` | 上下文压缩、会话收尾、记忆归档 |
 | `app/memory/identity.py` | 身份识别（名字+ID 解析、访客/实名的判断） |
 | `app/memory/interlocutor.py` | 对话角色管理（女友/访客模式切换） |
 | `app/memory/profile.py` | 人物画像读写与格式化 |
@@ -178,12 +174,13 @@ CONSOLE_LOG_WIDTH=100
 | `app/memory/emotion.py` | 情感轨迹追踪 |
 | `app/memory/contacts.py` | 第三方人物画像管理 |
 | `app/memory/correction.py` | 记忆自动修正（用户纠错触发） |
-| `app/memory/consolidator.py` | **MemoryConsolidator — 统一写入仲裁器**，每轮分类后裁决记忆沉淀 + 关系状态 + Open Loop |
+| `app/memory/consolidator.py` | **MemoryConsolidator — 统一写入仲裁器** |
 | `app/memory/self_state.py` | 机器人自我状态管理 |
+| `app/memory/unified_store.py` | **统一记忆存储** — memory_items 表读写入口 |
 | `app/persona/card.py` | 机器人人格卡片加载（persona.md） |
 | `app/persona/ingest.py` | 语料分块/入库/降噪 |
-| `app/store/chunks.py` | L3 文本分块和 FTS 查询构造 |
-| `app/memory_admin.py` | L0/Profile/L2 管理 API 后端 |
+| `app/store/chunks.py` | 文本分块和 FTS 查询构造 |
+| `app/memory_admin.py` | 核心事实/画像/近期记忆管理 API 后端 |
 | `app/person_admin.py` | 用户身份管理 API 后端 |
 
 ## 代码约定

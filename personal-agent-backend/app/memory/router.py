@@ -1,38 +1,34 @@
 """
-记忆召回路由 —— 按用户身份决定检索策略，协调多层记忆的联合召回。
+记忆召回路由 —— 按用户身份决定检索策略，协调记忆的联合召回。
 
 ============================================================================
 在陪伴型情感机器人记忆体系中的角色：
   Router 是"记忆调度中心"——每轮对话开始时，根据用户身份（访客/已实名）
-  决定从哪些记忆层检索、检索顺序、以及是否触发关联扩展。
+  决定检索哪些记忆类型、检索优先级、以及是否触发关联扩展。
 
 召回策略：
 
   访客模式（tmp_* / 未实名）：
-    → 仅返回 L1 工作记忆（当前会话窗口）
+    → 仅返回当前会话窗口（history）
     → 不调用 embedding（节省 API 费用）
-    → L0/L2/L3 全部为空
+    → 核心记忆/情景记忆/长期记忆/关联记忆全部为空
 
   已实名模式（verified person_id）：
-    1. L0 全量加载（无向量门控，无条件注入）
-    2. L2 向量检索 episodic；无命中 → fallback 注入最近 N 条摘要
-    3. L3 混合检索（仅当 query_needs_memory_answer 为 True 时触发）
-    4. 联想扩展：基于 L3 命中结果做 memory_relations 图扩展
+    1. 核心记忆全量加载（无向量门控，无条件注入）
+    2. 情景记忆检索；无命中 → fallback 注入最近摘要
+    3. 长期记忆检索（仅当 query 需要记忆回答时触发，含月份 FTS 补召）
+    4. 关联记忆扩展：基于长期记忆命中做图扩展
     5. 情感轨迹：附加最近情感快照
 
-输出结构（memory dict）：
+输出结构（语义 memory dict）：
   {
-    working:     L1 消息列表
-    episodic:    L2 摘要列表
-    semantic:    L3 文本列表
-    l3:          L3 文本列表（同上，新字段名）
-    l0:          L0 核心事实列表
-    l2_hit:      L2 检索是否命中
-    l3_hit:      L3 检索是否命中
-    memory_miss: 是否完全未命中（用于反幻觉提示）
-    person_id:   活跃用户 ID
-    guest_mode:  是否访客模式
-    matches:     {l2: [...], l3: [...], related: [...]} 原始召回数据
+    history:      当前会话消息列表
+    items:        MemoryItem 列表（core + recent + long_term + related）
+    diagnostics:  {person_id, guest_mode, has_recent, has_long_term,
+                   evidence_count, evidence_weak, evidence_sources, ...}
+    memory_miss:  是否完全未命中（用于反幻觉提示）
+    person_id:    活跃用户 ID
+    guest_mode:   是否访客模式
   }
 ============================================================================
 """
@@ -41,17 +37,15 @@ from __future__ import annotations
 
 import hashlib
 import time
+from dataclasses import dataclass
 
 from app.config import settings
 from app.llm import embed_texts
-from app.memory.l2 import episodic_memory
-from app.memory.guard import extract_self_name, is_noise_memory_for_l3, query_needs_memory_answer
-from app.memory.l0 import list_l0_cached
-from app.memory.l1 import working_memory
-from app.memory.relations import expand_associative_recall, seed_keys_from_l3_matches
+from app.memory.guard import extract_self_name, is_casual_smalltalk, query_needs_memory_answer
+from app.memory.working_context import get_recent_context
 from app.memory.emotion import emotion_trajectory
 from app.memory.identity import memory_scoped_to_person
-from app.memory.l3 import semantic_memory
+from app.memory.unified_store import unified_memory_store, MemorySearchQuery
 from app.session import store
 
 # ── Embedding 查询向量缓存 ─────────────────────────────────────────────────
@@ -60,6 +54,45 @@ from app.session import store
 _EMBED_CACHE_SIZE = 128
 _EMBED_CACHE_TTL = 300.0
 _embed_cache: dict[str, tuple[float, list[float]]] = {}
+
+
+@dataclass(frozen=True)
+class RetrievalPlan:
+    """一次召回的语义检索计划。
+
+    字段描述的是产品意图，不再让调用方直接关心底层存储层名称。
+    """
+
+    needs_memory: bool
+    search_recent_memory: bool
+    search_long_term: bool
+    include_recent_episodes: bool
+    recent_top_k: int
+    long_term_top_k: int
+    month_key: str = ""
+
+
+class RetrievalPlanner:
+    """按用户消息生成统一记忆检索计划。"""
+
+    def plan(self, query: str, *, working: list[dict]) -> RetrievalPlan:
+        q = (query or "").strip()
+        month_key = _parse_month_key(q) or ""
+        casual = is_casual_smalltalk(q)
+        needs_memory = query_needs_memory_answer(q)
+        has_context = bool(working)
+
+        search_recent_memory = bool(q) and not casual and (needs_memory or has_context)
+        search_long_term = bool(q) and needs_memory
+        return RetrievalPlan(
+            needs_memory=needs_memory,
+            search_recent_memory=search_recent_memory,
+            search_long_term=search_long_term,
+            include_recent_episodes=bool(q) and not needs_memory and not casual,
+            recent_top_k=settings.recent_memory_top_k if search_recent_memory else 0,
+            long_term_top_k=(6 if month_key else 3) if search_long_term else 0,
+            month_key=month_key,
+        )
 
 
 def _cached_embed(text: str, cache_key: str = "") -> list[float]:
@@ -118,8 +151,8 @@ def _batch_embed(texts: list[str]) -> list[list[float]]:
     return results
 
 
-def _enrich_l3_query(query: str, working: list[dict]) -> str:
-    """用 L1 上下文扩充 L3 检索查询——解决短追问丢失前文主题的问题。
+def _enrich_long_term_query(query: str, working: list[dict]) -> str:
+    """用 工作上下文 上下文扩充长期记忆检索查询——解决短追问丢失前文主题的问题。
 
     场景：用户先说「之前在粥顶山玩的时候...」，
     然后追问「你真的想起来了吗」。
@@ -128,7 +161,7 @@ def _enrich_l3_query(query: str, working: list[dict]) -> str:
 
     Args:
         query:   当前用户消息
-        working: L1 最近消息列表 [{"role": "user"/"assistant", "content": ...}, ...]
+        working: 工作上下文 最近消息列表 [{"role": "user"/"assistant", "content": ...}, ...]
 
     Returns:
         扩充后的 query，无需扩充时返回原 query。
@@ -205,8 +238,8 @@ def _parse_month_key(query: str) -> str | None:
 
     q = query.strip()
 
-    # 1. 2025年6月 / 2025年06月 / 2025年六月
-    m = re.search(r"(\d{4})\s*年\s*(?:(\d{1,2})|([一二三四五六七八九十]{1,2}))\s*月", q)
+    # 1. 2025年6月 / 2025年06月 / 2025年六月 / 2025年-6月
+    m = re.search(r"(\d{4})\s*年\s*-?\s*(?:(\d{1,2})|([一二三四五六七八九十]{1,2}))\s*月", q)
     if m:
         year = int(m.group(1))
         month = _cn_month_to_int(m.group(2) or m.group(3) or "")
@@ -232,7 +265,7 @@ def _parse_month_key(query: str) -> str | None:
     return None
 
 
-def _expand_l3_query_dates(query: str) -> str:
+def _expand_long_term_query_dates(query: str) -> str:
     """Append ISO month tags so FTS can hit ## 2024-04 style headings."""
     mk = _parse_month_key(query)
     if not mk:
@@ -246,144 +279,11 @@ def _expand_l3_query_dates(query: str) -> str:
     return query + " " + " ".join(extras)
 
 
-def _build_l3_query(query: str, working: list[dict], self_name: str | None) -> str:
-    base = _enrich_l3_query(query, working)
+def _build_long_term_query(query: str, working: list[dict], self_name: str | None) -> str:
+    base = _enrich_long_term_query(query, working)
     if self_name and self_name not in base:
         base = f"{base} {self_name}"
-    return _expand_l3_query_dates(base)
-
-
-def _chunk_section_month(text: str) -> str | None:
-    """从 L3 chunk 文本中提取月份标识 YYYY-MM。
-
-    支持的格式：
-      - ## YYYY-MM（标准 Markdown 标题）
-      - # YYYY-MM 月度记忆
-      - [时间: YYYY-MM]（元数据标签）
-      - time: YYYY-MM / 时间：YYYY-MM
-    """
-    import re
-
-    # 1. ## YYYY-MM 或 # YYYY-MM 月度记忆
-    m = re.search(r"(?:##|#|\*\*)\s*(\d{4}-\d{2})\b", text or "")
-    if m:
-        return m.group(1)
-
-    # 2. [时间: YYYY-MM] 或 [time: YYYY-MM]
-    m = re.search(r"(?:时间|time)\s*[:：]\s*(\d{4}-\d{2})\b", text or "")
-    if m:
-        return m.group(1)
-
-    return None
-
-
-def _is_month_primary_chunk(text: str, source: str, mk: str) -> bool:
-    """判断 L3 chunk 是否属于指定月份。
-
-    检查顺序：
-      1. 文本内标题匹配（## YYYY-MM / [时间: YYYY-MM]）
-      2. source 路径包含 monthly/.../YYYY-MM.md
-    """
-    if _chunk_section_month(text) == mk:
-        return True
-    if f"/{mk}.md" in source or f"{mk}.md" in source:
-        return True
-    return False
-
-
-def _boost_month_l3_matches(
-    query: str,
-    matches: list[dict],
-    *,
-    person_id: str,
-    persona_person_id: str,
-) -> list[dict]:
-    """When user names a month, prefer chunks whose ## heading matches YYYY-MM.
-
-    优先级（从高到低）：
-      1. monthly/liu_yuanhui/YYYY-MM.md 和 events/relationship/*YYYY-MM*
-         （用户问"我俩之间"或未指定第三方时）
-      2. monthly/friends_group/YYYY-MM.md
-         （用户问唐凯/伍钰涛/朋友群时）
-      3. 其他命中 chunk
-    """
-    import re as _re
-
-    mk = _parse_month_key(query)
-    if not mk:
-        return matches
-
-    # 检测是否在问朋友/第三方
-    asks_about_friend = bool(_re.search(r"唐凯|伍钰涛|朋友|朋友群|兄弟们", query))
-    asks_about_relationship = bool(_re.search(r"我俩|我们之间|我们俩|远慧|和她|我跟他?", query))
-
-    def month_bucket(m: dict) -> int:
-        sm = _chunk_section_month(str(m.get("text", "")))
-        if sm == mk:
-            return 0
-        if sm:
-            return 2
-        return 1
-
-    def source_priority(m: dict) -> int:
-        """返回排序优先级：0=最优先, 1=中性, 2=最低。"""
-        src = str(m.get("source", "")).strip()
-        cat = str(m.get("category", "")).strip()
-        text = str(m.get("text", ""))[:200]
-
-        is_relationship = "monthly/liu_yuanhui/" in src or "events/relationship/" in src
-        is_event = cat in ("monthly", "event")
-        is_friends = "monthly/friends_group/" in src or "唐凯" in text or "伍钰涛" in text
-
-        if asks_about_friend and not asks_about_relationship:
-            return 0 if is_friends else (1 if is_relationship else 2)
-        if asks_about_relationship and not asks_about_friend:
-            return 0 if is_relationship else (1 if is_friends else 2)
-        # 未明确指定时：relationship > friends > 其他
-        return 0 if is_relationship else (1 if is_friends else 2)
-
-    on_month = [m for m in matches if _is_month_primary_chunk(str(m.get("text", "")), str(m.get("source", "")), mk)]
-    # 按优先级排序
-    on_month.sort(key=source_priority)
-    if len(on_month) >= 2:
-        neutral = [m for m in matches if month_bucket(m) == 1]
-        neutral.sort(key=source_priority)
-        return (on_month + neutral)[: max(5, len(matches))]
-
-    extras = [persona_person_id] if persona_person_id else []
-    year, month_num = mk.split("-")
-    month_cn = {v: k for k, v in _CN_MONTHS.items() if v <= 12}.get(int(month_num), "")
-    fts_query = f"{mk} {year}年{int(month_num)}月 {month_cn}月 monthly/{year}-{month_num}"
-    fts_rows = store.l3_fts_search_pool(
-        fts_query,
-        person_id,
-        extra_person_ids=extras,
-        limit=12,
-    )
-    injected: list[dict] = []
-    seen = {str(m.get("text", "")).strip() for m in matches if m.get("text")}
-    for row in fts_rows:
-        text = str(row.get("text", "")).strip()
-        if not text or text in seen or not _is_month_primary_chunk(text, str(row.get("source", "")), mk):
-            continue
-        seen.add(text)
-        injected.append(
-            {
-                "text": text,
-                "score": 0.99,
-                "chunk_id": row.get("chunk_id", ""),
-                "category": str(row.get("category") or ""),
-                "source": str(row.get("source") or ""),
-                "collection": str(row.get("collection") or "memory"),
-            }
-        )
-
-    neutral = [m for m in matches if month_bucket(m) == 1]
-    neutral.sort(key=source_priority)
-    on_month_vec = [m for m in on_month if m not in injected]
-    on_month_vec.sort(key=source_priority)
-    merged = injected + on_month_vec + neutral
-    return merged[: max(5, len(matches))]
+    return _expand_long_term_query_dates(base)
 
 
 def _has_content_entities(text: str) -> bool:
@@ -409,49 +309,46 @@ def _has_content_entities(text: str) -> bool:
 def _empty_recall(working: list[dict], *, reason: str) -> dict:
     """构建空的召回结果字典（访客模式或无数据时使用）。
 
-    返回结构中所有 L2/L3/L0 字段均为空列表，memory_miss=False（因为
-    访客模式不算"未命中"，只是不启用检索）。agent 模块检查 guest_mode
-    决定是否注入记忆到 prompt。
-
-    Args:
-        working: L1 当前会话消息列表
-        reason:  空召回的原因描述（如 "guest_l1_only"）
+    返回语义 dict：history/items/diagnostics，不含旧 核心事实/近期记忆/长期记忆 字段。
     """
     return {
-        "working": working,
-        "episodic": [],
-        "semantic": [],
-        "l3": [],
-        "l0": [],
-        "l2_hit": False,
-        "l3_hit": False,
-        "facts_hit": False,
-        "corpus_triggered": False,
-        "corpus_reason": [reason] if reason else [],
+        "history": working,
+        "items": [],
+        "diagnostics": {
+            "person_id": None,
+            "guest_mode": True,
+            "reason": reason,
+            "has_recent": False,
+            "has_long_term": False,
+            "core_memory_count": 0,
+            "retrieval_plan": {},
+        },
         "memory_miss": False,
         "person_id": None,
         "guest_mode": True,
-        "matches": {"l2": [], "l3": [], "related": []},
     }
 
 
 class MemoryRouter:
-    """记忆召回路由器：协调 L0/L1/L2/L3 多层记忆的联合召回。
+    """记忆召回路由器：通过 UnifiedMemoryStore 协调语义检索。
 
     核心设计：
-      - 每条记忆层的检索都是独立的，router 负责编排它们的调用顺序
-      - 访客模式下跳过所有向量检索，仅返回 L1
-      - L3 检索按需触发（query_needs_memory_answer 门控），避免无效检索
+      - 通过 RetrievalPlanner 生成语义检索计划，调用方不直接关心内部存储层
+      - 访客模式下跳过所有向量检索，仅返回 history
+      - 长期记忆检索按需触发（RetrievalPlan 门控），避免无效检索和 embedding 浪费
     """
 
+    def __init__(self, planner: RetrievalPlanner | None = None) -> None:
+        self.planner = planner or RetrievalPlanner()
+
     def _recall_guest(self, working: list[dict]) -> dict:
-        """访客模式召回：仅返回 L1 当前会话消息。
+        """访客模式召回：仅返回 工作上下文 当前会话消息。
 
         访客模式的核心节约：不调用 embedding API，不查询任何持久化存储，
         仅从当前会话的 messages 表读取最近消息。这是系统的"浅度模式"，
         适用于未实名用户和匿名访客。
         """
-        payload = _empty_recall(working, reason="guest_l1_only")
+        payload = _empty_recall(working, reason="guest_working_context_only")
         payload["person_id"] = None
         return payload
 
@@ -463,160 +360,92 @@ class MemoryRouter:
         *,
         person_id: str | None = None,
     ) -> dict:
-        """执行完整的多层记忆召回。
+        """执行完整的多层记忆召回，返回语义 dict。
 
         召回流程：
-          1. 获取 L1 工作记忆（当前会话消息）
-          2. 判断是否为已实名用户：否 → 访客模式，仅返回 L1
-          3. 从用户消息提取自称名，用于 L3 query 改写
-          4. L0 全量加载
-          5. L2 向量检索（有 query）或 fallback 最近摘要（无 query）
-          6. L3 混合检索（仅 query_needs_memory_answer 为 True 时触发）
-          7. 记忆关联图扩展
-          8. 情感轨迹附加
-          9. 汇总所有结果
-
-        Args:
-            device_id:  设备标识
-            session_id: 会话标识
-            query:      检索查询文本（通常是用户当前消息或改写后的）
-            person_id:  用户 ID（None 或不提供则从 session 读取）
+          1. 获取当前会话消息（history）
+          2. 判断是否为已实名用户：否 → 访客模式，仅返回 history
+          3. 生成 RetrievalPlan + embedding
+          4. 调用 unified_memory_store.search() 统一检索（含月份增强 + 关联扩展）
+          5. 情感轨迹附加
+          6. 返回语义 dict（history/items/diagnostics）
 
         Returns:
-            完整的多层记忆召回字典。
+            语义 dict: {history, items, diagnostics, memory_miss, person_id, guest_mode}
         """
-        # Step 1: L1 工作记忆
-        working = working_memory.get_recent(session_id)
+        # Step 1: 工作上下文 工作记忆
+        working = get_recent_context(session_id)
         pid = str(person_id or "").strip()
 
         # Step 2: 访客判断 → 跳过所有嵌入检索
         if not memory_scoped_to_person(pid):
             return self._recall_guest(working)
 
-        # Step 3: query 预处理
+        # Step 3: 生成语义检索计划 + embedding
         q = query.strip()
-        # 从用户消息中提取自称名，用于 L3 检索 query 改写
-        # 例如用户说"我是刘远慧"→ 用"刘远慧"做 L3 检索，提高命中率
+        plan = self.planner.plan(q, working=working)
         self_name = extract_self_name(q)
-        l3_query = _build_l3_query(q, working, self_name)
-        # q_emb 用于 L2 检索，l3_emb 用于 L3 检索（可能不同，因为 query 改写）
-        # 批量向量化：q 和 l3_query 合并为一次 API 调用（含缓存）
-        if q and l3_query and l3_query != q:
-            embs = _batch_embed([q, l3_query])
+        long_term_query = _build_long_term_query(q, working, self_name)
+
+        q_emb = None
+        long_term_emb = None
+        if q and plan.search_recent_memory and plan.search_long_term and long_term_query and long_term_query != q:
+            embs = _batch_embed([q, long_term_query])
             q_emb = embs[0] if embs[0] else None
-            l3_emb = embs[1] if embs[1] else q_emb
-        elif q:
+            long_term_emb = embs[1] if embs[1] else q_emb
+        elif q and (plan.search_recent_memory or plan.search_long_term):
             q_emb = _cached_embed(q) or None
-            l3_emb = q_emb
-        else:
-            q_emb = None
-            l3_emb = None
-        # needs_memory：门控函数，判断用户是否在问需要记忆的东西
-        # "你好"/"在吗"等寒暄不需要查 L3，节省 embedding 调用
-        needs_memory = query_needs_memory_answer(query)
+            long_term_emb = q_emb
 
-        # Step 4: L0 全量加载（带缓存，无条件，无门控）
-        l0_rows = list_l0_cached(pid)
-
-        # Step 5: L2 情景记忆检索
-        l2_matches = episodic_memory.recall_scored(
-            device_id, pid, query, settings.episodic_top_k, q_emb=q_emb
+        # Step 4: 通过 UnifiedMemoryStore 统一检索（含月份增强 + 关联扩展）
+        persona_pid = str(getattr(settings, "persona_fact_person_id", "") or "").strip()
+        search_spec = MemorySearchQuery(
+            device_id=device_id,
+            person_id=pid,
+            query=q,
+            q_emb=q_emb,
+            long_term_query=long_term_query,
+            long_term_emb=long_term_emb,
+            include_recent=plan.search_recent_memory,
+            include_long_term=plan.search_long_term,
+            include_recent_episodes=plan.include_recent_episodes,
+            include_related=True,
+            recent_top_k=plan.recent_top_k,
+            long_term_top_k=plan.long_term_top_k,
+            month_key=plan.month_key,
+            persona_person_id=persona_pid,
         )
-        l2_hit = any(m.get("score") is not None for m in l2_matches)
-        # 用户在问需要记忆的事实：禁止注入「最近几条 L2」兜底，避免无关摘要诱发编造
-        if not l2_matches and not needs_memory:
-            l2_matches = episodic_memory.recall_scored(
-                device_id, pid, "", settings.l2_recall_recent, q_emb=None
-            )
-        elif needs_memory and not l2_hit:
-            l2_matches = []
-        episodic = [m["text"] for m in l2_matches if m.get("text")]
+        result = unified_memory_store.search(search_spec)
 
-        # Step 6: L3 语义记忆检索（按需触发）
-        # 只有 query_needs_memory_answer 返回 True 才检索 L3。
-        # 门控原因：寒暄短句（"你好"/"在吗"）不需要查长期记忆，
-        # 跳过 L3 检索可节省一次 embedding API 调用和一次数据库查询。
-        l3_matches: list[dict] = []
-        if needs_memory:
-            # 附加人物画像事实的 person_id（跨用户共享的人物知识）
-            # 例如 persona/corpus/ 中的通用人物百科，不属于特定用户，
-            # 但对所有实名用户都有参考价值。
-            persona_pid = str(getattr(settings, "persona_fact_person_id", "") or "").strip()
-            l3_top_k = 6 if _parse_month_key(q) else 3
-            l3_matches = semantic_memory.recall_l3_scored(
-                device_id,
-                pid,
-                l3_query,
-                l3_top_k,
-                q_emb=l3_emb,
-                persona_person_id=persona_pid,
-            )
-            l3_matches = [
-                m for m in l3_matches if not is_noise_memory_for_l3(m.get("text", ""))
-            ]
-            l3_matches = _boost_month_l3_matches(
-                q,
-                l3_matches,
-                person_id=pid,
-                persona_person_id=persona_pid,
-            )
-            l3_thresh = settings.l3_sim_threshold
-            l3_matches = [
-                m for m in l3_matches if (m.get("score") or 0) >= l3_thresh
-            ]
-            # 月份查询不再清空未命中月份 chunk 的结果（_boost_month_l3_matches
-            # 已通过 FTS 补注），保留已有结果让 LLM 获得可用上下文。
+        # Step 5: memory_miss 判定
+        needs_memory = plan.needs_memory
+        has_recent = result.diagnostics.get("has_recent", False)
+        has_long_term = result.diagnostics.get("has_long_term", False)
+        has_related = bool(result.related_items)
+        memory_miss = needs_memory and not has_recent and not has_long_term and not has_related
 
-        l3_hit = bool(l3_matches)
-        l3_texts = [str(m["text"]) for m in l3_matches if m.get("text")]
-
-        # Step 7: 记忆关联图扩展
-        # 从 L3 命中结果提取种子节点（chunk_id），在 memory_relations 表中
-        # 查找关联的记忆块（strength >= memory_relation_min_strength），
-        # 扩展召回范围（链式记忆：想起一件事，带出相关的事）
-        seed_keys = seed_keys_from_l3_matches(l3_matches)
-        related_matches = expand_associative_recall(seed_keys, person_id=pid)
-        # 去重：排除已在 L3 主结果中出现的文本
-        matched_texts = {str(m.get("text", "")).strip() for m in l3_matches if m.get("text")}
-        related_matches = [
-            r
-            for r in related_matches
-            if str(r.get("text", "")).strip() not in matched_texts
-        ]
-
-        # memory_miss: 所有检索层都无命中 → 需要反幻觉提示介入
-        # 告诉 Agent："我不知道，因为记忆里没有相关信息"。
-        # 仅当 needs_memory=True（用户在问需要记忆的东西）且所有层都无命中时
-        # 才设为 True。寒暄短句的 memory_miss 为 False，不影响。
-        memory_miss = needs_memory and not l2_hit and not l3_hit and not related_matches
-
-        # Step 8: 情感轨迹
-        # 附加最近的情感快照（最近 3-5 次对话的情感状态趋势），
-        # 帮助 agent 感知用户近期情绪变化，调整回复语气。
+        # Step 7: 情感轨迹
         emo_traj = emotion_trajectory(device_id, pid)
 
-        # Step 9: 汇总结果
+        # Step 8: 汇总语义结果
+        all_items = (
+            result.core_items
+            + result.recent_items
+            + result.long_term_items
+            + result.related_items
+        )
         return {
-            "working": working,
-            "episodic": episodic,
-            "semantic": l3_texts,
-            "l3": l3_texts,
-            "l0": l0_rows,
-            "l2_hit": l2_hit,
-            "l3_hit": l3_hit,
-            "facts_hit": l3_hit,          # 兼容旧字段名
-            "corpus_triggered": l3_hit,   # 兼容旧字段名
-            "corpus_reason": ["l3_unified"] if needs_memory and l3_hit else [],
-            "memory_miss": memory_miss,   # 全部未命中 → Agent 应表示不知道
+            "history": working,
+            "items": all_items,
+            "diagnostics": result.diagnostics | {
+                "person_id": pid,
+                "guest_mode": False,
+                "retrieval_plan": plan.__dict__ if hasattr(plan, "__dict__") else {},
+                "emotion_trajectory": emo_traj,
+            },
+            "memory_miss": memory_miss,
             "person_id": pid,
             "guest_mode": False,
-            "emotion_trajectory": emo_traj,
-            "matches": {
-                "l2": l2_matches,
-                "l3": l3_matches,
-                "related": related_matches,
-            },
-            "month_key": _parse_month_key(q) or "",
         }
 
 
@@ -628,54 +457,44 @@ class MemoryRouter:
         *,
         person_id: str | None = None,
     ) -> dict:
-        """快速召回 —— 仅 L0+L1+最近 L2，跳过 L3、关系图和情感事件。
+        """快速召回 —— 仅核心事实+历史+最近情景，跳过长期检索、关系图和情感事件。
 
-        用于低延迟语音场景的首响：
-          - 首轮先确保回复速度（快速注入 L0/L1/L2）
-          - L3 等完整记忆通过异步后补（见 dialog_orchestrator）
-
-        参数同 recall()。
+        用于低延迟语音场景的首响。
         """
-        working = working_memory.get_recent(session_id)
+        working = get_recent_context(session_id)
         pid = str(person_id or "").strip()
 
         if not memory_scoped_to_person(pid):
             return self._recall_guest(working)
 
-        q = query.strip()
-        # 快速 L2 无需 embedding：直接取最近几条摘要
-        l0_rows = list_l0_cached(pid)
-        l2_matches = episodic_memory.recall_scored(
-            device_id, pid, q,
-            settings.episodic_top_k,
+        # 通过 UnifiedMemoryStore 快速检索（core + recent recent only）
+        search_spec = MemorySearchQuery(
+            device_id=device_id,
+            person_id=pid,
+            query=query.strip(),
             q_emb=None,
+            include_recent=False,
+            include_long_term=False,
+            include_recent_episodes=True,
+            include_related=False,
+            recent_top_k=0,
+            long_term_top_k=0,
         )
-        l2_hit = any(m.get("score") is not None for m in l2_matches)
-        if not l2_matches:
-            l2_matches = episodic_memory.recall_scored(
-                device_id, pid, "",
-                settings.l2_recall_recent, q_emb=None,
-            )
-        episodic = [m["text"] for m in l2_matches if m.get("text")]
+        result = unified_memory_store.search(search_spec)
 
-        memory_miss = False  # fast 路径不判定 memory_miss（L3 不存在时不触发反幻觉）
-
+        all_items = result.core_items + result.recent_items
         return {
-            "working": working,
-            "episodic": episodic,
-            "semantic": [],
-            "l3": [],
-            "l0": l0_rows,
-            "l2_hit": l2_hit,
-            "l3_hit": False,
-            "facts_hit": False,
-            "corpus_triggered": False,
-            "corpus_reason": ["fast_recall_skip_l3"],
-            "memory_miss": memory_miss,
+            "history": working,
+            "items": all_items,
+            "diagnostics": result.diagnostics | {
+                "person_id": pid,
+                "guest_mode": False,
+                "retrieval_plan": {},
+                "recall_mode": "fast",
+            },
+            "memory_miss": False,
             "person_id": pid,
             "guest_mode": False,
-            "matches": {"l2": l2_matches, "l3": [], "related": []},
-            "month_key": "",
         }
 
 

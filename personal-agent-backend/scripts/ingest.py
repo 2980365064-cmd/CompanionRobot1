@@ -30,7 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.rag import ingest_directory
+from app.persona.ingest import ingest_directory
 
 
 def main() -> None:
@@ -45,11 +45,11 @@ def main() -> None:
 
     from app.embed_meta import check_embed_compat, save_embed_meta
     from app.llm import embed_provider_name
-    from app.memory.l3 import clear_persona_derived_memory, semantic_memory
+    from app.memory.long_term_memory import clear_derived_memory, long_term_memory
 
     if args.reset:
-        semantic_memory.reset_corpus()
-        cleared = clear_persona_derived_memory()
+        long_term_memory.reset_corpus()
+        cleared = clear_derived_memory()
         print(f"Cleared persona data: {cleared}")
 
     result = ingest_directory(reset=args.reset, extract_facts=False)
@@ -62,7 +62,7 @@ def main() -> None:
     ok, msg = check_embed_compat()
     print("Sources:", ", ".join(files))
     print(
-        f"Ingested {semantic_memory.corpus.count()} chunks "
+        f"Ingested {long_term_memory.count_chunks()} chunks "
         f"(provider={embed_provider_name()}, dim={meta.get('dim')})"
     )
     print(msg if ok else f"WARNING: {msg}")

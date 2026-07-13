@@ -40,16 +40,15 @@ _QUIET_LOGGERS = (
     "chromadb",
     "openai",
     "app.memory.semantic",
-    "app.rag",
     "app.llm",
     "app.memory.router",
-    "app.memory.extractor",
+    "app.memory.memory_pipeline",
     "app.ws_handler",
 )
 
 # 工程术语检测列表（用于 prompt_summary）
 _ENGINEERING_TERMS = [
-    "L0", "L1", "L2", "L3",
+
     "向量", "检索", "命中", "命中率",
     "记忆库", "数据库中", "关联网络", "strength",
     "FTS", "embedding", "未匹配", "无相关记录",
@@ -108,8 +107,6 @@ class AgentMonitor:
       set_timing()    — 注入阶段耗时
       turn_timer()    — 计时上下文管理器
 
-    旧方法保留兼容：
-      chat_user(), chat_memory(), chat_reply(), finish_turn()
     """
 
     def __init__(self) -> None:
@@ -174,7 +171,7 @@ class AgentMonitor:
     # ── 公用方法（所有模式可用） ────────────────────────────────────
 
     def banner(self, title: str) -> None:
-        """分节标题线（兼容旧代码）。"""
+        """输出分节标题线。"""
         if self._mode_is("silent"):
             return
         self._line(f"\n--- {title} " + "-" * max(0, 40 - len(title)))
@@ -293,7 +290,8 @@ class AgentMonitor:
         pack_v2 = None
         if memory_pack is not None:
             try:
-                pack_v2 = getattr(memory_pack, "_v2", None) or (
+                pack_v2 = memory_pack if hasattr(memory_pack, "items_for_prompt") else None
+                pack_v2 = pack_v2 or getattr(memory_pack, "_v2", None) or (
                     memory_pack.to_v2() if hasattr(memory_pack, "to_v2") else None
                 )
             except Exception:
@@ -306,24 +304,24 @@ class AgentMonitor:
         import app.memory.schema as _schema
 
         # 月份查询标记
-        raw = getattr(pack_v2, "_raw", {}) or {}
-        mk = str(raw.get("month_key", "") or "")
+        diag = getattr(pack_v2, "diagnostics", {}) or {}
+        mk = str(diag.get("month_key", "") or "")
         if mk:
             self._line(f"│ MemoryPackV2:")
             self._line(f"│   month_key={mk}")
         else:
             self._line(f"│ MemoryPackV2:")
 
-        # L3 命中摘要（source / category / score）
-        l3_matches = (raw.get("matches") or {}).get("l3") or []
-        if l3_matches:
-            l3_lines: list[str] = []
-            for m in l3_matches[:6]:
+        # 长期记忆命中摘要（source / category / score）
+        long_term = diag.get("long_term") or []
+        if long_term:
+            hit_lines: list[str] = []
+            for m in long_term[:6]:
                 src = str(m.get("source", "—"))[:24]
                 cat = str(m.get("category", "—"))[:16]
                 scr = f"{m.get('score', 0):.3f}" if m.get("score") is not None else "recent"
-                l3_lines.append(f"{src}|{cat}|{scr}")
-            self._line(f"│   l3_hits={' · '.join(l3_lines)}")
+                hit_lines.append(f"{src}|{cat}|{scr}")
+            self._line(f"│   long_term_hits={' · '.join(hit_lines)}")
 
         # 关系状态块
         rel = pack_v2.relationship
@@ -362,14 +360,15 @@ class AgentMonitor:
             return
 
         if memory.get("guest_mode"):
-            self._line(f"│ 记忆: 访客模式 · 仅 L1 上下文")
+            self._line("│ 记忆: 访客模式 · 仅工作上下文")
             return
 
         # 尝试从 MemoryPackV2 获取摘要
         pack_v2 = None
         if memory_pack is not None:
             try:
-                pack_v2 = getattr(memory_pack, "_v2", None) or (
+                pack_v2 = memory_pack if hasattr(memory_pack, "items_for_prompt") else None
+                pack_v2 = pack_v2 or getattr(memory_pack, "_v2", None) or (
                     memory_pack.to_v2() if hasattr(memory_pack, "to_v2") else None
                 )
             except Exception:
@@ -390,13 +389,13 @@ class AgentMonitor:
             self._line(f"│ 记忆包: {' · '.join(summary_parts)}")
             return
 
-        # 降级到旧 dict 格式
-        matches = memory.get("matches") or {}
-        l2_n = len(matches.get("l2") or [])
-        l3_n = len(matches.get("l3") or [])
-        related_n = len(matches.get("related") or [])
+        # MemoryPackV2 不可用时，读取当前语义 diagnostics。
+        diag = memory.get("diagnostics") or {}
+        recent_n = len(diag.get("recent") or [])
+        long_term_n = len(diag.get("long_term") or [])
+        related_n = len(diag.get("related") or [])
         miss = "是" if memory.get("memory_miss") else "否"
-        self._line(f"│ 记忆: L2={l2_n} L3={l3_n} 联想={related_n} 未命中={miss}")
+        self._line(f"│ 记忆: 近期={recent_n} 长期={long_term_n} 联想={related_n} 未命中={miss}")
 
     # ── Prompt 安全摘要 ────────────────────────────────────────────
 
@@ -548,146 +547,6 @@ class AgentMonitor:
             s = result.corrections_applied
             events.append(f"记忆修正 · 删{s.get('deleted_facts',0)} 增{s.get('added_facts',0)}")
         return events
-
-    # ── 旧方法兼容（仍可使用，但新代码推荐用上面的新方法） ──────────
-
-    def chat_user(self, device_id: str, message: str) -> None:
-        """旧版轮次入口（保持兼容）。"""
-        if self._mode_is("silent"):
-            return
-        self.banner("对话")
-        dev = device_id if device_id != "default" else ""
-        prefix = f"[{dev}] " if dev else ""
-        self._line(f">> 用户 {prefix}{message}")
-
-    def _print_match_layer(
-        self,
-        layer: str,
-        items: list[dict],
-        *,
-        empty_msg: str,
-        fmt_item,
-    ) -> None:
-        """打印单层记忆命中列表（兼容旧代码）。"""
-        if self._mode_is("silent"):
-            return
-        if not items:
-            self._line(f"  {layer}  {empty_msg}")
-            return
-        self._line(f"  {layer}  命中 {len(items)} 条")
-        for i, item in enumerate(items, 1):
-            self._line(f"    [{i}] {fmt_item(item)}")
-
-    def chat_memory(
-        self,
-        memory: dict,
-        query: str,
-        *,
-        person_profile: dict | None = None,
-        promotion_eval=None,
-    ) -> None:
-        """旧版记忆摘要（保持兼容）。"""
-        if self._mode_is("silent"):
-            return
-
-        if person_profile:
-            from app.memory.profile import (
-                normalize_profile,
-                profile_display_name,
-                profile_nicknames,
-            )
-            p = normalize_profile(person_profile)
-            nick = profile_display_name(p) or (
-                profile_nicknames(p)[0] if profile_nicknames(p) else "?"
-            )
-            rel = getattr(p, "relationship", None) or p.get("relationship", "—")
-            pid = str(p.get("person_id") or "")[:12]
-            confirmed = "已确认" if p.get("confirmed") else "待确认"
-            self._line(f"  对象  {nick}（{rel}）  {confirmed} id={pid}…")
-        elif memory.get("guest_mode"):
-            mem_pid = memory.get("person_id") or "—"
-            self._line(f"  对象  访客（仅 L1） tmp={str(mem_pid)[:16]}…")
-        else:
-            mem_pid = memory.get("person_id")
-            if mem_pid:
-                self._line(f"  对象  已绑定 person_id={str(mem_pid)[:12]}…")
-            else:
-                self._line("  对象  未绑定")
-
-        matches = memory.get("matches") or {}
-        l0_n = len(memory.get("l0") or [])
-        l2_hit = memory.get("l2_hit", False)
-        l3_hit = memory.get("l3_hit", memory.get("facts_hit", False))
-        memory_miss = memory.get("memory_miss", False)
-        l1_ctx = len(memory.get("working") or [])
-
-        if memory.get("guest_mode"):
-            self._line(f"  记忆  访客模式 · 仅 L1={l1_ctx}条")
-            return
-
-        miss_tag = "须承认不清楚" if memory_miss else "—"
-        self._line(
-            f"  记忆  L0={l0_n}条(全量必载)"
-            f"  L1上下文={l1_ctx}条(仅注入不检索)"
-            f"  L2={'命中' if l2_hit else '未命中'}"
-            f"  L3={'命中' if l3_hit else '未命中'}"
-            f"  联想={len(matches.get('related') or [])}条"
-            f"  未命中={miss_tag}"
-        )
-        self._print_match_layer(
-            "L2",
-            matches.get("l2") or [],
-            empty_msg="无相关摘要",
-            fmt_item=lambda m: f"sim={_fmt_score(m.get('score'))} {_clip(m.get('text', ''), 96)}",
-        )
-        l3_items = matches.get("l3") or []
-        self._print_match_layer(
-            "L3",
-            l3_items,
-            empty_msg="无相关 Facts/语料",
-            fmt_item=lambda m: (
-                f"sim={_fmt_score(m.get('score'))} "
-                f"[{m.get('category') or m.get('source') or 'memory'}] "
-                f"{_clip(m.get('text', ''), 88)}"
-            ),
-        )
-        related_items = matches.get("related") or []
-        if related_items:
-            self._print_match_layer(
-                "联想",
-                related_items,
-                empty_msg="—",
-                fmt_item=lambda m: (
-                    f"{m.get('relation_type', 'related')}·{m.get('strength', 0.5)} "
-                    f"{_clip(m.get('text', ''), 88)}"
-                ),
-            )
-        if memory_miss:
-            self._line(f"  ⚠ L2/L3 均无相关内容，查询: {_clip(query, 48)}")
-
-    def chat_reply(self, reply: str, elapsed_ms: float) -> None:
-        """旧版回复+耗时（保持兼容）。"""
-        if self._mode_is("silent"):
-            return
-        self._line(f"<< 回复 {reply}")
-        self._line(f"   耗时 {elapsed_ms:.0f}ms")
-
-    def finish_turn(
-        self,
-        memory: dict,
-        query: str,
-        reply: str,
-        t0: float,
-        *,
-        person_profile: dict | None = None,
-        promotion_eval=None,
-    ) -> None:
-        """旧版轮次收尾（保持兼容）。"""
-        self.chat_memory(
-            memory, query, person_profile=person_profile, promotion_eval=promotion_eval
-        )
-        self.chat_reply(reply, (time.perf_counter() - t0) * 1000)
-
 
 # 全局单例
 agent_monitor = AgentMonitor()

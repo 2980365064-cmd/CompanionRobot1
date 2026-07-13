@@ -30,7 +30,7 @@
     → 请求:  {"type":"abort"}
     （后端取消飞行中的 TTS 任务，丢弃剩余 bubbles）
 
-  session_end:  主动结束会话（L1→L2 收尾）
+  session_end:  主动结束会话（工作上下文→近期记忆 收尾）
     → 请求:  {"type":"session_end"}
     ← 响应:  {"type":"session_end_ack", "session_id":"..."}
 
@@ -64,7 +64,7 @@ from app.agent import generate_memory_topic, handle_chat_stream, handle_session_
 from app.memory.interlocutor import is_mode_switch_message
 from app.config import settings
 from app.monitor import agent_monitor
-from app.tts import TTSConfig, TTSException, tts_fetch_pcm
+from app.services.tts_client import TTSConfig, TTSException, tts_fetch_pcm
 
 logger = logging.getLogger(__name__)
 
@@ -398,7 +398,8 @@ async def ws_chat_endpoint(websocket: WebSocket) -> None:
                     await websocket.send_json({"type": "error", "code": "empty_message", "message": "empty message"})
                     continue
                 try:
-                    tts_cfg = _get_tts_config() if _tts_enabled() else None
+                    want_tts = bool(data.get("tts", True))
+                    tts_cfg = _get_tts_config() if want_tts and _tts_enabled() else None
                     active_tts = ActiveTTSContext()
 
                     # 流式生成：边收 token 边累积发送气泡
@@ -629,15 +630,15 @@ async def idle_session_sweeper() -> None:
     工作原理：
       1. 遍历活跃的 WebSocket 连接，对超过 session_idle_minutes 无活动的连接调用 handle_session_end
       2. 对 HTTP 创建的会话，通过 store.list_idle_active_sessions() 查询过期会话，
-         过滤掉仍在活跃 WS 连接中的，对其余执行 consolidate_session（L1→L2 压缩）
+         过滤掉仍在活跃 WS 连接中的，对其余执行 consolidate_session（工作上下文→近期记忆 压缩）
       3. 每 tick 最多处理 20 个过期 HTTP 会话，避免一次性负载过大
 
     为什么需要这个机制：
       - 用户可能直接关闭浏览器/微信而不发送 session_end 消息
-      - L1 消息积累太多会占用内存，需要定期清理
-      - 实名用户的 L1 需要压入 L2 才能形成长期记忆
+      - 工作上下文 消息积累太多会占用内存，需要定期清理
+      - 实名用户的 工作上下文 需要压入 近期记忆 才能形成长期记忆
     """
-    from app.memory.extractor import consolidate_session
+    from app.memory.memory_pipeline import finalize_session_memory
     from app.session import store
 
     max_per_tick = 20  # 每 tick 最多处理的 HTTP 会话数，防止瞬时负载过高
@@ -667,11 +668,11 @@ async def idle_session_sweeper() -> None:
             if sid in ws_session_ids:
                 continue
             try:
-                # consolidate_session 包含 L1→L2 压缩和画像转正，是同步操作；
+                # consolidate_session 包含 工作上下文→近期记忆 压缩和画像转正，是同步操作；
                 # 通过 asyncio.to_thread 放到线程池，避免阻塞事件循环。
-                await asyncio.to_thread(consolidate_session, str(row["device_id"]), sid)
+                await asyncio.to_thread(finalize_session_memory, str(row["device_id"]), sid)
                 closed += 1
             except Exception as exc:
                 agent_monitor.warn(f"HTTP 空闲会话整理失败 {sid[:8]}: {exc}")
         if closed:
-            agent_monitor.event(f"空闲整理 · {closed} 个历史会话已压缩进 L2")
+            agent_monitor.event(f"空闲整理 · {closed} 个历史会话已压缩进 近期记忆")

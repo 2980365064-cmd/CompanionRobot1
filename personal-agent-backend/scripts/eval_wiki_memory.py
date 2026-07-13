@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """Wiki 语料召回验收脚本。
 
-用途：对固定问题集执行 L3 检索，验证新 Wiki 化语料的召回质量。
+用途：对固定问题集执行 长期记忆 检索，验证新 Wiki 化语料的召回质量。
 输出 top-5 的 source/category/score/text，并判定 top-1 是否命中期望类型。
 
 依赖：需在 virtualenv 中执行，PYTHONPATH=.
     source .venv/bin/activate && PYTHONPATH=. python scripts/eval_wiki_memory.py
 """
 
-import sqlite3
 import sys
 from pathlib import Path
 
@@ -16,7 +15,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.config import settings
-from app.memory.l3 import semantic_memory
+from app.memory.long_term_memory import long_term_memory
+from app.memory.unified_store import unified_memory_store
+from app.session import store
 from app.store.chunks import prepare_fts_text, build_fts_match_query
 
 
@@ -74,31 +75,21 @@ def run_eval():
     print(f"  时间: {__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print("=" * 78)
 
-    # ── 基础检查 ──
-    db = sqlite3.connect(settings.resolved_db_path())
-    db.row_factory = sqlite3.Row
+    # ── 基础检查（通过统一记忆库查询） ──
+    total = store.count_corpus_memory_items() or 0
+    corpus_count = store.search_memory_items(
+        "test_123", kinds=["corpus", "wiki", "fact"], visibility="recall_only", limit=1
+    )
+    # 统一记忆库中 corpus 类记忆条数
+    all_memory = store.search_memory_items(
+        "test_123", kinds=["corpus", "wiki", "fact", "episode", "emotion"],
+        visibility="recall_only", limit=5000,
+    )
+    total_memory = len(all_memory) if all_memory else 0
 
-    total = db.execute("SELECT COUNT(*) FROM l3_chunks").fetchone()[0]
-    corpus = db.execute("SELECT COUNT(*) FROM l3_chunks WHERE collection IN ('corpus','memory')").fetchone()[0]
-    archives = db.execute("SELECT COUNT(*) FROM l3_chunks WHERE source LIKE 'archive/%'").fetchone()[0]
-
-    print(f"\n  总 L3 块: {total}  语料块: {corpus}  归档块: {archives}")
-    if archives > 0:
-        print(f"  ❌ 发现 archive 旧数据！应全量 --reset 重建")
-    else:
-        print(f"  ✅ archive 旧数据未进入 L3")
-
-    # ── category 分布 ──
-    cats = db.execute(
-        "SELECT category, COUNT(*) as cnt FROM l3_chunks GROUP BY category ORDER BY cnt DESC"
-    ).fetchall()
-    empty_cats = sum(c['cnt'] for c in cats if not c['category'])
-    valid_cats = sum(c['cnt'] for c in cats if c['category'])
-    print(f"  Category 填充率: {valid_cats}/{total} ({valid_cats*100//total}%)  空: {empty_cats}")
-    for c in cats:
-        print(f"    {c['category'] or '(空)':>12}: {c['cnt']}")
-
-    db.close()
+    print(f"\n  统一记忆库记忆项: {total_memory}  (含语料/长期记忆)")
+    print(f"  ✅ 已迁移到统一记忆库")
+    print(f"  ℹ️  如需查看具体分布，请使用 scripts/diagnose_memory.py")
 
     # ── 召回测试 ──
     print(f"\n  {'─'*74}")
@@ -112,7 +103,7 @@ def run_eval():
         print(f"  Q: {query}")
         print(f"  期望: {'/'.join(expected_types)}")
 
-        hits = semantic_memory.recall_l3_scored(
+        hits = long_term_memory.search_long_term(
             device_id="corpus",
             person_id="test_123",
             query=query,

@@ -1,9 +1,9 @@
 """
-情感轨迹追踪 —— 从 L2 摘要中提取情感快照，构建跨会话的情感趋势感知。
+情感轨迹追踪 —— 从 近期记忆 摘要中提取情感快照，构建跨会话的情感趋势感知。
 
 ============================================================================
 在陪伴型情感机器人记忆体系中的角色：
-  每次 L2 摘要生成时，LLM 会附带一个 emotion JSON（包含 mood/情绪标签、
+  每次 近期记忆 摘要生成时，LLM 会附带一个 emotion JSON（包含 mood/情绪标签、
   intensity/强度、trigger/诱因、attitude/用户对话态度）。
   本模块读取最近 N 次会话的情感快照，构建一条"情感轨迹"，
   注入 system prompt 让 Agent 感知用户的情绪走向。
@@ -15,7 +15,7 @@
   - 趋势预警：连续 2+ 次负面 → 提示"近期情绪持续偏负面，多倾听共情"
   - 单次预警：上次负面 → 提示"本轮留意用户状态，勿轻浮调侃"
 
-数据来源：episodic_memories 表每条记录的 emotion 字段（JSON 格式）。
+数据来源：memory_items 中 kind=episode 记录的情感字段（JSON 格式）。
 ============================================================================
 """
 
@@ -29,10 +29,10 @@ from app.session import store
 def emotion_trajectory(device_id: str, person_id: str, last_n: int = 5) -> list[dict]:
     """读取最近 N 次会话的情感快照，按时间倒序排列。
 
-    从 L2 episodic_memories 表中提取有 emotion 字段的记录，
+    从近期记忆记录中提取有 emotion 字段的记录，
     解析 mood/intensity/trigger/attitude 四个维度，附上会话日期。
 
-    数据获取策略：取 last_n * 2 条 L2 记录作为备选（因为部分记录可能没有
+    数据获取策略：取 last_n * 2 条 近期记忆 记录作为备选（因为部分记录可能没有
     emotion 字段，或 emotion JSON 格式不合法），从中筛选出有效情感记录，
     最终返回最多 last_n 条。
 
@@ -53,16 +53,16 @@ def emotion_trajectory(device_id: str, person_id: str, last_n: int = 5) -> list[
     pid = str(person_id or "").strip()
     if not pid or not device_id:
         return []
-    # 多取一些备选：部分 L2 记录可能没有 emotion 字段，
+    # 多取一些备选：部分 近期记忆 记录可能没有 emotion 字段，
     # 或者 emotion JSON 解析失败，所以需要比目标数更大的候选池
-    rows = store.list_episodic_active(device_id, pid, limit=last_n * 2)
+    rows = store.list_active_recent_memory(device_id, pid, limit=last_n * 2)
     out: list[dict] = []
     for row in rows:
         raw = row.get("emotion") or ""
         if not raw:
             continue
         try:
-            # emotion 字段存储为 JSON 字符串，在 L2 写入时由 LLM 生成
+            # emotion 字段存储为 JSON 字符串，在 近期记忆 写入时由 LLM 生成
             emo = json.loads(raw) if isinstance(raw, str) else raw
         except (json.JSONDecodeError, TypeError):
             # LLM 输出偶尔可能不是合法 JSON，跳过该条记录
