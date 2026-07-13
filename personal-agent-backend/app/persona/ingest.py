@@ -1,40 +1,33 @@
-"""persona/corpus/ 语料入库模块 —— 支持 frontmatter 解析、章节级分块、上下文注入。
+"""persona/corpus/ 语料入库模块 —— 两阶段幂等同步 pipeline。
 
 职责：扫描 persona/corpus/ 目录下的 Markdown 语料文件，经过 frontmatter 解析、
-剔除对话范例、去噪、章节级分块、上下文前缀注入后写入 L3 长期记忆存储。
+剔除对话范例、去噪、章节级分块、上下文前缀注入后，以幂等方式同步到 memory_items。
 
 数据流：
   persona/corpus/*.md
-  → 读取 → frontmatter 解析 → 剔除对话范例 → 降噪
-  → ## 章节分块 → 上下文前缀注入 → 字符分块 → L3 存储
+  → build_corpus_chunk_specs()   [阶段 1：纯文件扫描，产出稳定 source_id]
+  → sync_corpus_chunk_specs()    [阶段 2：幂等同步到 DB， upsert 新块、删除过期块]
+  → startup_ingest_corpus() √ audit  [启动时审计性跳过]
 
-阶段 2 增强（2026-07）：
-  - 解析 YAML frontmatter（type/people/time/topics/privacy/status/confidence）
-  - 按 ## 标题划分语义块，保留结构完整性
-  - 每个块注入 [人物: xxx][时间: YYYY-MM][主题: xxx][类型: xxx] 上下文前缀
-  - 将 type 写入 L3 category 字段，支持后续检索按类型偏向
-  - 保持向后兼容：无 frontmatter 的旧文件按原有方式处理
-
-注意：
-  - 本模块只做分块入库，不再抽取 Facts（Facts 抽取已迁移到独立模块）
-  - 入库后的语料可通过 semantic_memory 模块进行语义/关键词检索
-  - 启动时的语料同步由 startup_ingest_corpus 控制，避免重复入库
+新规范（2026-07 收口版）：
+  - 所有 corpus 行：kind='wiki', source='wiki', source_table='corpus'
+  - source_id = '<relative_path>#s<section_index>p<part_index>'（稳定主键）
+    例如：monthly/liu_yuanhui/2025-04.md#s1p0  表示第1张第0块
+  - source_path 写入 context_json.source_path
+  - month_key 从 files/frontmatter/time 解析，写入 context_json.month_key
+  - sync 逻辑确保 DB 中的 corpus 子集 ≡ 文件系统切块结果
 """
 
 from __future__ import annotations
 
 import fnmatch
+import json
 import logging
 import re
 from pathlib import Path
 from typing import Any
 
 from app.config import settings
-from app.memory.l3 import (
-    batch_extract_facts_from_persona_chunks,
-    clear_persona_derived_memory,
-    semantic_memory,
-)
 from app.memory.person_resolver import invalidate_wiki_cache, sync_wiki_people_to_contacts
 
 logger = logging.getLogger(__name__)
@@ -257,7 +250,7 @@ def strip_dialogue_examples(text: str) -> str:
     """剔除语料中的 Q→A 对话范例段落。
 
     原因：口吻范例应放在 persona/style/ 目录下，通过 Profile Card 注入；
-    persona/corpus/ 中的语料入库到 L3 后用于检索召回，不应包含对话范例，
+    persona/corpus/ 中的语料入库到长期记忆后用于检索召回，不应包含对话范例，
     否则会导致"用户问了一个相似问题，机器人检索到了范例中的回答"这种错误行为。
 
     剔除逻辑：
@@ -293,7 +286,7 @@ def strip_dialogue_examples(text: str) -> str:
 def _is_noise_file(path: Path) -> bool:
     """判断文件是否命中配置中的噪声文件跳过规则。
 
-    从 settings.l3_noise_file_patterns 读取以逗号分隔的 glob 模式，
+    从 settings.long_term_memory_noise_file_patterns 读取以逗号分隔的 glob 模式，
     匹配文件名（支持通配符如 *.log、*.tmp 等）。
 
     Args:
@@ -302,9 +295,9 @@ def _is_noise_file(path: Path) -> bool:
     Returns:
         True 表示该文件应被跳过，不参与入库
     """
-    if not settings.l3_denoise_enabled:
+    if not settings.long_term_memory_denoise_enabled:
         return False
-    patterns = [p.strip() for p in settings.l3_noise_file_patterns.split(",") if p.strip()]
+    patterns = [p.strip() for p in settings.long_term_memory_noise_file_patterns.split(",") if p.strip()]
     name = path.name
     return any(fnmatch.fnmatch(name, p) for p in patterns)
 
@@ -382,58 +375,85 @@ def chunk_text(text: str, chunk_size: int = 320, overlap: int = 64) -> list[str]
     return chunks
 
 
-def ingest_directory(
-    corpus_dir: Path | None = None,
-    *,
-    reset: bool = False,
-    extract_facts: bool | None = None,
-) -> dict:
-    """扫描 persona/corpus/ 目录，将所有 md/txt 语料入库到 L3 长期记忆。
+# ══════════════════════════════════════════════════════════════════════════════
+# 阶段 1：build_corpus_chunk_specs — 纯文件扫描，产出稳定 source_id
+# ══════════════════════════════════════════════════════════════════════════════
 
-    增强的入库流程（阶段 2）：
-    1. 遍历 corpus_dir 下所有 .md/.txt 文件
-    2. 跳过 skip 名单中的文件（README、示例等）
-    3. 对每个文件：
-       a. 解析 YAML frontmatter（提取 type/people/time/topics/privacy/status/confidence）
-       b. 剔除对话范例
-       c. 行级降噪
-       d. 按 ## 标题划分语义块
-       e. 每块注入 [人物: xxx][时间: YYYY-MM][类型: xxx] 上下文前缀
-       f. 必要时子分块
-    4. 批量写入 L3 存储（自动生成 embedding + type→category + confidence）
-    5. 可选：从语料块中提取结构化 Facts
+
+def _guess_month_key(source_path: str, body: str, fm_meta: dict) -> str:
+    """从 frontmatter time / 文件路径 / 正文中推测 YYYY-MM。
+
+    Returns:
+        "YYYY-MM" 格式的字符串，无匹配时返回空字符串。
+    """
+    import re as _re
+
+    # 1. frontmatter time 字段
+    raw_time = str(fm_meta.get("time", "") or "").strip()
+    m = _re.match(r"(\d{4})\s*[-/年]\s*(\d{1,2})(?:月|$)", raw_time)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}"
+
+    # 2. 文件路径中的月份模式：monthly/xxx/2025-04.md, 2025年4月.md 等
+    m2 = _re.search(r"(\d{4})\s*[-/年]?\s*(\d{1,2})\s*月?", source_path)
+    if m2:
+        return f"{m2.group(1)}-{int(m2.group(2)):02d}"
+
+    # 3. 正文中的 ## YYYY-MM 标题
+    m3 = _re.search(r"##\s*(\d{4})-(\d{2})", body)
+    if m3:
+        return f"{m3.group(1)}-{m3.group(2)}"
+
+    return ""
+
+
+def _is_corpus_file(path: Path, corpus_dir: Path) -> bool:
+    """判断文件是否应纳入语料扫描范围。"""
+    if not path.is_file():
+        return False
+    if path.suffix.lower() not in {".md", ".txt"}:
+        return False
+    if path.name in _SKIP_NAMES or path.name.endswith(".example"):
+        return False
+    if _is_noise_file(path):
+        return False
+    rel = path.relative_to(corpus_dir).as_posix()
+    if rel.startswith("archive/"):
+        return False
+    return True
+
+
+def build_corpus_chunk_specs(
+    corpus_dir: Path | None = None,
+) -> list[dict]:
+    """阶段 1：纯文件扫描，构建 corpus chunk 规格列表。
+
+    每个 spec 包含稳定的 source_id（<relative_path>#<chunk_index>），
+    用于后续 sync 阶段的幂等 upsert。
 
     Args:
         corpus_dir: 语料目录路径，默认从 settings 读取
-        reset: 是否先清空旧语料再入库（True 用于换 embedding 模型后重建）
-        extract_facts: 是否提取 Facts；None 时使用配置项 persona_ingest_extract_facts
 
     Returns:
-        入库结果汇总字典，包含字段：
-        - files: 已入库的文件相对路径列表
-        - corpus_chunks: 入库的总块数
-        - fact_stats: Facts 提取统计（chunks/facts/skipped）
+        chunk_spec 列表，每项为 dict：
+        - source_path: str — 文件相对路径
+        - source_id: str — '<source_path>#s<section>p<part>'
+        - kind: str — 固定 'wiki'
+        - source: str — 固定 'wiki'
+        - text: str — 注入上下文前缀后的完整文本块
+        - month_key: str — 推测的月份标识（空串表示无法推测）
+        - category: str — 类型标签（从 frontmatter type 或猜测）
+        - confidence: float — 置信度
+        - meta: dict — 元数据（含 source_table/source_id/source_path/month_key 等）
     """
     corpus_dir = corpus_dir or settings.resolved_corpus_dir()
-    chunks: list[dict] = []
-    idx = 0
-    ingested: list[str] = []
+    specs: list[dict] = []
+
     for path in sorted(corpus_dir.glob("**/*")):
-        if not path.is_file():
-            continue
-        # 仅处理 Markdown 和纯文本格式的语料
-        if path.suffix.lower() not in {".md", ".txt"}:
-            continue
-        if path.name in _SKIP_NAMES or path.name.endswith(".example"):
-            continue
-        if _is_noise_file(path):
-            continue
-        # 跳过 archive/ 目录下的旧语料，避免重复入库
-        rel = path.relative_to(corpus_dir).as_posix()
-        if rel.startswith("archive/"):
+        if not _is_corpus_file(path, corpus_dir):
             continue
 
-        # === 阶段 2 增强：frontmatter 解析 + 章节分块 + 上下文注入 ===
+        rel = path.relative_to(corpus_dir).as_posix()
         raw = path.read_text(encoding="utf-8", errors="ignore").strip()
         fm_meta, body = parse_frontmatter(raw)
         body = strip_dialogue_examples(body)
@@ -442,59 +462,337 @@ def ingest_directory(
             continue
 
         context_prefix = build_context_prefix(fm_meta)
+        month_key = _guess_month_key(rel, body, fm_meta)
+        category = str(fm_meta.get("type", ""))
+        confidence = float(fm_meta.get("confidence", 0.0))
         sections = split_by_sections(body)
 
         if sections:
-            # 新流程：按 ## 章节分块
-            for section in sections:
+            for ci, section in enumerate(sections):
                 parts = _chunk_section(section, context_prefix)
-                for part in parts:
-                    chunks.append({
-                        "id": f"doc-{idx}",
+                for pi, part in enumerate(parts):
+                    source_id = f"{rel}#s{ci}p{pi}"
+                    specs.append({
+                        "source_path": rel,
+                        "source_id": source_id,
+                        "kind": "wiki",
+                        "source": "wiki",
                         "text": part,
+                        "month_key": month_key,
+                        "category": category or _guess_category(rel, fm_meta),
+                        "confidence": confidence,
                         "meta": {
-                            "source": rel,
-                            "category": str(fm_meta.get("type", "")),
-                            "confidence": float(fm_meta.get("confidence", 0.0)),
+                            "source_table": "corpus",
+                            "source_id": source_id,
+                            "source_path": rel,
+                            "month_key": month_key,
+                            "category": category or _guess_category(rel, fm_meta),
+                            "confidence": confidence,
                         },
                     })
-                    idx += 1
         elif context_prefix:
-            # 有 frontmatter 但无 ## 结构（如极短文）：注入前缀后全量
             full = f"{context_prefix}\n{body}"
-            chunks.append({
-                "id": f"doc-{idx}",
+            source_id = f"{rel}#s0p0"
+            specs.append({
+                "source_path": rel,
+                "source_id": source_id,
+                "kind": "wiki",
+                "source": "wiki",
                 "text": full,
+                "month_key": month_key,
+                "category": category or _guess_category(rel, fm_meta),
+                "confidence": confidence,
                 "meta": {
-                    "source": rel,
-                    "category": str(fm_meta.get("type", "")),
-                    "confidence": float(fm_meta.get("confidence", 0.0)),
+                    "source_table": "corpus",
+                    "source_id": source_id,
+                    "source_path": rel,
+                    "month_key": month_key,
+                    "category": category or _guess_category(rel, fm_meta),
+                    "confidence": confidence,
                 },
             })
-            idx += 1
         else:
-            # 无 frontmatter 也无 ## 结构：纯文本 fallback（保持向后兼容）
-            for part in chunk_text(body):
-                chunks.append({"id": f"doc-{idx}", "text": part, "meta": {"source": rel}})
-                idx += 1
+            for ci, part in enumerate(chunk_text(body)):
+                source_id = f"{rel}#s0p{ci}"
+                specs.append({
+                    "source_path": rel,
+                    "source_id": source_id,
+                    "kind": "wiki",
+                    "source": "wiki",
+                    "text": part,
+                    "month_key": month_key,
+                    "category": category,
+                    "confidence": confidence,
+                    "meta": {
+                        "source_table": "corpus",
+                        "source_id": source_id,
+                        "source_path": rel,
+                        "month_key": month_key,
+                        "category": category,
+                        "confidence": confidence,
+                    },
+                })
 
-        ingested.append(rel)
+    return specs
 
-    fact_stats = {"chunks": 0, "facts": 0, "skipped": 0}
-    do_extract = (
-        extract_facts
-        if extract_facts is not None
-        else bool(getattr(settings, "persona_ingest_extract_facts", False))
+
+def _guess_category(rel_path: str, fm_meta: dict) -> str:
+    """从文件路径或 frontmatter 推测类别。"""
+    cat = str(fm_meta.get("type", "") or "").strip()
+    if cat:
+        return cat
+    if "people/" in rel_path or rel_path.startswith("people/"):
+        return "person"
+    if "monthly/" in rel_path:
+        return "monthly"
+    if "profile/" in rel_path or rel_path.startswith("profile/"):
+        return "profile"
+    return "general"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 阶段 2：sync_corpus_chunk_specs — 幂等同步到 memory_items
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def sync_corpus_chunk_specs(
+    specs: list[dict],
+    *,
+    reset: bool = False,
+) -> dict:
+    """阶段 2：将 chunk specs 幂等同步到 memory_items（source_table='corpus'）。
+
+    同步规则（一次性保证源文件状态 ≡ DB 状态）：
+      1. 对 specs 中的每个 source_id 执行 upsert
+      2. 删除 DB 中存在但 specs 中不存在的 source_id（过期块）
+      3. 当 reset=True 时，先全量删除再全量写入
+
+    Args:
+        specs: build_corpus_chunk_specs 返回的 spec 列表
+        reset: 是否先全量清空再写入
+
+    Returns:
+        {"written": int, "errors": int, "stale_deleted": int, "total_specs": int}
+    """
+    from app.llm import embed_texts
+    from app.session import store
+
+    if not specs:
+        if reset:
+            store.reset_corpus_items()
+            return {"written": 0, "errors": 0, "stale_deleted": 0, "total_specs": 0}
+        return {"written": 0, "errors": 0, "stale_deleted": 0, "total_specs": 0}
+
+    # ── reset 模式：先全量删除 ──
+    if reset:
+        store.reset_corpus_items()
+
+    # ── 批量计算 embedding ──
+    texts = [s["text"] for s in specs]
+    embs = embed_texts(texts) or []
+    if len(embs) != len(texts):
+        embs = embs + ([[]] * (len(texts) - len(embs)))
+
+    # ── 查询 DB 中现有的 corpus source_id 集合 ──
+    existing_ids = set(store.list_corpus_source_ids())
+    expected_ids = {s["source_id"] for s in specs if s.get("source_id")}
+
+    # ── 逐个 upsert ──
+    written = 0
+    errors = 0
+    for i, spec in enumerate(specs):
+        meta = spec.get("meta", {})
+        source_id = spec.get("source_id", "")
+        if not source_id:
+            continue
+        emb = embs[i] if i < len(embs) else []
+        context = {
+            "source_path": spec.get("source_path", ""),
+        }
+        if spec.get("month_key"):
+            context["month_key"] = spec["month_key"]
+        if meta.get("category"):
+            context["category"] = meta["category"]
+
+        try:
+            store.write_memory_item(
+                person_id="",
+                device_id="",
+                kind=spec.get("kind", "wiki"),
+                source=spec.get("source", "wiki"),
+                source_table="corpus",
+                source_id=source_id,
+                visibility="recall_only",
+                content=spec.get("text", ""),
+                confidence=meta.get("confidence", 0.8),
+                context_json=json.dumps(context, ensure_ascii=False),
+                tags_json="[]",
+                embedding_json=json.dumps(emb) if emb else "[]",
+            )
+            written += 1
+        except Exception as exc:
+            logger.error("corpus sync failed for source_id=%s: %s", source_id, exc)
+            errors += 1
+
+    # ── 删除过期 source_id（reset 模式下无需再删） ──
+    stale_deleted = 0
+    if not reset:
+        stale_ids = existing_ids - expected_ids
+        for sid in stale_ids:
+            try:
+                if store.delete_corpus_item_by_source_id(sid):
+                    stale_deleted += 1
+            except Exception as exc:
+                logger.warning("corpus stale delete failed for %s: %s", sid, exc)
+
+    # ── 去重：清理 upsert 后可能残留的重复行（如旧数据遗留） ──
+    dedup_removed = 0
+    if not reset:
+        try:
+            dedup_removed = store.dedup_corpus_source_ids()
+            if dedup_removed:
+                logger.info("corpus sync dedup: removed %d duplicate rows", dedup_removed)
+        except Exception as exc:
+            logger.warning("corpus dedup failed: %s", exc)
+
+    # ── 最终库状态统计 ──
+    try:
+        final_corpus_rows = store.count_corpus_memory_items()
+        final_corpus_ids = len(store.list_corpus_source_id_counts())
+    except Exception:
+        final_corpus_rows = written - errors
+        final_corpus_ids = written - errors
+
+    return {
+        "written": written,
+        "errors": errors,
+        "stale_deleted": stale_deleted,
+        "total_specs": len(specs),
+        "dedup_removed": dedup_removed,
+        "final_corpus_rows": final_corpus_rows,
+        "final_corpus_ids": final_corpus_ids,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 审计：audit_corpus_sync_state — 只读对比文件系统与 DB
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def audit_corpus_sync_state(
+    corpus_dir: Path | None = None,
+) -> dict:
+    """只读审计：对比文件系统预期 source_id 与数据库中实际 source_id。
+
+    除检测缺失/多余外，新增对数据库物理重复行的检测。
+    不修改任何数据。
+
+    Returns:
+        {
+            "is_complete": bool,
+            "missing_source_ids": list[str],       — DB 中缺失的 source_id
+            "stale_source_ids": list[str],           — DB 中多余的 source_id
+            "duplicate_source_ids": list[str],       — 物理重复的 source_id（有多行）
+            "expected_chunk_count": int,             — 逻辑期望唯一块数
+            "actual_chunk_count": int,               — 去重后的唯一 source_id 数
+            "actual_row_count": int,                 — 物理行数
+            "source_files": list[str],               — 扫描到的源文件列表
+        }
+
+    完整性判定：
+        missing_source_ids == []
+        stale_source_ids == []
+        duplicate_source_ids == []
+        actual_row_count == expected_chunk_count
+    """
+    from app.session import store
+
+    corpus_dir = corpus_dir or settings.resolved_corpus_dir()
+    if not corpus_dir.exists():
+        return {
+            "is_complete": False,
+            "missing_source_ids": [],
+            "stale_source_ids": [],
+            "duplicate_source_ids": [],
+            "expected_chunk_count": 0,
+            "actual_chunk_count": 0,
+            "actual_row_count": 0,
+            "source_files": [],
+        }
+
+    # 文件系统端
+    expected_specs = build_corpus_chunk_specs(corpus_dir)
+    expected_ids = {s["source_id"] for s in expected_specs if s.get("source_id")}
+    source_files = sorted({s["source_path"] for s in expected_specs if s.get("source_path")})
+
+    # DB 端：带重复检测
+    id_counts = store.list_corpus_source_id_counts()
+    actual_ids_set = set(id_counts.keys())
+    actual_row_count = sum(id_counts.values()) if id_counts else 0
+    duplicate_ids = sorted(
+        sid for sid, cnt in id_counts.items() if cnt > 1
     )
 
-    if chunks:
-        # 将语料块写入 L3 存储（含向量化和索引构建）
-        semantic_memory.ingest_chunks(chunks, reset=reset)
-        if do_extract:
-            # 可选：从语料块中提取结构化事实，用于关系网络构建
-            fact_stats = batch_extract_facts_from_persona_chunks(chunks)
+    missing = sorted(expected_ids - actual_ids_set)
+    stale = sorted(actual_ids_set - expected_ids)
 
-    # Wiki 人物页同步到 contact：入库后，将 persona/corpus/people/*.md 的人物生成为第三方画像
+    is_complete = (
+        len(missing) == 0
+        and len(stale) == 0
+        and len(duplicate_ids) == 0
+        and actual_row_count == len(expected_ids)
+    )
+
+    return {
+        "is_complete": is_complete,
+        "missing_source_ids": missing,
+        "stale_source_ids": stale,
+        "duplicate_source_ids": duplicate_ids,
+        "expected_chunk_count": len(expected_ids),
+        "actual_chunk_count": len(actual_ids_set),
+        "actual_row_count": actual_row_count,
+        "source_files": source_files,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 对外接口：ingest_directory / startup_ingest_corpus
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def ingest_directory(
+    corpus_dir: Path | None = None,
+    *,
+    reset: bool = False,
+    extract_facts: bool | None = None,
+) -> dict:
+    """扫描 persona/corpus/ 目录，以幂等方式同步全部语料到 memory_items。
+
+    内部调用 build_corpus_chunk_specs() + sync_corpus_chunk_specs()。
+
+    Args:
+        corpus_dir: 语料目录路径，默认从 settings 读取
+        reset: 是否先清空旧 corpus 再全量重建
+        extract_facts: 不再使用（仅保持签名兼容）
+
+    Returns:
+        入库结果字典：
+        - files: 已处理的源文件相对路径列表
+        - corpus_chunks: 写入的总块数
+        - fact_stats: （保持兼容）{"chunks":0,"facts":0,"skipped":0}
+        - sync_stats: sync_corpus_chunk_specs 返回的详细统计
+        - wiki_synced: wiki→contact 同步的条目数
+    """
+    del extract_facts  # 不再使用
+
+    specs = build_corpus_chunk_specs(corpus_dir)
+    sync_stats = sync_corpus_chunk_specs(specs, reset=reset)
+
+    ingested_files = sorted(
+        {s["source_path"] for s in specs if s.get("source_path")}
+    )
+
+    # Wiki 人物页同步到 contact
     wiki_synced = 0
     try:
         sync_results = sync_wiki_people_to_contacts()
@@ -508,24 +806,23 @@ def ingest_directory(
         logger.warning("wiki->contact sync failed: %s", exc)
 
     return {
-        "files": ingested,
-        "corpus_chunks": len(chunks),
-        "fact_stats": fact_stats,
+        "files": ingested_files,
+        "corpus_chunks": sync_stats.get("written", 0),
+        "fact_stats": {"chunks": 0, "facts": 0, "skipped": 0},
+        "sync_stats": sync_stats,
         "wiki_synced": wiki_synced,
     }
 
 
 def startup_ingest_corpus() -> dict:
-    """启动时自动语料同步。
-
-    设计意图：确保应用启动后 L3 长期记忆中有可供检索的语料数据，
-    但不重复入库已有的数据。
+    """启动时自动语料同步（审计型跳过）。
 
     逻辑：
-    - 如果 persona_ingest_on_startup 配置为 False，跳过
-    - 如果 L3 中已有语料且未设置 reset，跳过（避免重复入库）
-    - 如果设置了 persona_ingest_reset_on_startup=True，则清空后重新入库
-    - 启动时只做 Corpus 入库，不做 Facts 提取（提取在 scripts/ingest.py 中手动触发）
+    - persona_ingest_on_startup=false → 跳过
+    - persona_ingest_reset_on_startup=true → 强制全量重建
+    - 否则执行 audit_corpus_sync_state()：
+      - is_complete → 跳过（打印审计结果）
+      - 不完整 → 自动增量同步
 
     Returns:
         执行结果字典，包含 skipped（是否跳过）和相关统计
@@ -533,32 +830,59 @@ def startup_ingest_corpus() -> dict:
     if not getattr(settings, "persona_ingest_on_startup", True):
         return {"skipped": True, "reason": "disabled"}
 
-    existing = semantic_memory.corpus.count()
     reset = bool(getattr(settings, "persona_ingest_reset_on_startup", False))
-    # 已有语料且不需要重置时跳过，避免启动变慢
-    if existing > 0 and not reset:
-        # 尽管 L3 已存在，每次启动仍同步 Wiki 人物页到 contact（处理新增人物页）
+
+    if reset:
+        logger.info("startup_ingest_corpus: reset=True, 全量重建")
+        cleared: dict = {}
+        try:
+            from app.memory.long_term_memory import clear_derived_memory
+            cleared = clear_derived_memory()
+        except Exception:
+            pass
+        result = ingest_directory(reset=True)
+        result["cleared"] = cleared
+        return result
+
+    # ── 审计模式：检查 corpus 完整性 ──
+    audit = audit_corpus_sync_state()
+
+    if audit["is_complete"]:
+        logger.info(
+            "corpus 已同步（%d 块，%d 个源文件），跳过启动入库",
+            audit["actual_chunk_count"],
+            len(audit["source_files"]),
+        )
+        # 仍同步 Wiki 人物页到 contact
         wiki_synced = 0
         try:
             sync_results = sync_wiki_people_to_contacts()
             invalidate_wiki_cache()
-            wiki_synced = len([r for r in sync_results if r["action"] in ("新建", "已存在，补全")])
-        except Exception as exc:
-            logger.warning("wiki->contact sync failed: %s", exc)
+            wiki_synced = len(
+                [r for r in sync_results if r["action"] in ("新建", "已存在，补全")]
+            )
+        except Exception:
+            pass
         return {
             "skipped": True,
-            "reason": "corpus_exists",
-            "corpus_chunks": existing,
+            "reason": "corpus_complete",
+            "audit": audit,
+            "corpus_chunks": audit["actual_chunk_count"],
             "files": [],
             "fact_stats": {"chunks": 0, "facts": 0, "skipped": 0},
             "wiki_synced": wiki_synced,
         }
 
-    cleared: dict = {}
-    if reset:
-        semantic_memory.reset_corpus()
-        cleared = clear_persona_derived_memory()
+    # ── 不完整：自动增量同步 ──
+    missing_count = len(audit["missing_source_ids"])
+    stale_count = len(audit["stale_source_ids"])
+    logger.warning(
+        "corpus 不完整：缺失 %d 个 source_id，多余 %d 个 source_id，触发增量同步",
+        missing_count,
+        stale_count,
+    )
 
-    result = ingest_directory(extract_facts=False, reset=reset)
-    result["cleared"] = cleared
+    result = ingest_directory()
+    result["audit"] = audit
+    result["audit_fixed"] = True
     return result

@@ -6,7 +6,7 @@
   Guard 是"安全阀和护城河"——承担两个关键职责：
 
 职责一：召回门控（原 intent.py 已并入前半段）
-  决定当前轮是否需要触发 L2/L3 记忆检索。
+  决定当前轮是否需要触发记忆检索。
   寒暄短句跳过检索（省 API 调用），回忆/追问类必须检索。
   核心函数：query_needs_memory_answer / has_recall_intent / is_casual_smalltalk
 
@@ -19,10 +19,10 @@
   1. 记忆库里没有的信息 → 必须说不知道/不清楚，可追问补充
   2. 本轮首次出现的自称/经历/关系 → 不能回复成老熟人
   3. 不确定 → 宁可短句追问，不编造
-  4. 人名 ≠ 身份：L3 中某人名出现不代表当前说话人就是那个人
+  4. 人名 ≠ 身份：长期记忆中人名出现不代表当前说话人就是那个人
 
 情感业务语义：
-  - 访客模式：用户未实名时，仅 L1 可用，不能假装认识
+  - 访客模式：用户未实名时，仅 工作上下文 可用，不能假装认识
   - 画像确认：名字/关系已在画像中确认的，才是"认识的人"
   - 女友口吻：刘远慧/刘大炮确认关系 → 启用调侃亲密口吻
 ============================================================================
@@ -36,11 +36,11 @@ from app.session import store
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 第一道防线：召回意图门控 —— 决定是否触发 L2/L3 向量检索
+# 第一道防线：召回意图门控 —— 决定是否触发记忆检索
 # ══════════════════════════════════════════════════════════════════════════════
 
 # 强回忆信号 —— 这些词出现时，用户明显在调用长期记忆
-# 匹配到 → 必须触发 L2/L3 检索
+# 匹配到 → 必须触发记忆检索
 _RECALL_STRONG = [
     r"还记得",
     r"记不记得",
@@ -90,7 +90,7 @@ _RECALL_PRESS = [
 
 # 个人信息类关键词 —— 涉及用户的身份、关系、经历
 # 匹配到 → 需要记忆检索参与回答
-# 注意：不再硬编码地名/场所（如杭州/南溪/爱琴海），这些由 L3 语义检索自然覆盖
+# 注意：不再硬编码地名/场所（如杭州/南溪/爱琴海），这些由语义检索自然覆盖
 _PERSONAL = [
     r"女朋友|男友|老婆|老公|远慧|刘远慧|刘大炮|秋雨|刘远航",
     r"你谁|我是谁|你是谁|叫什么名字|输错|打错",
@@ -128,7 +128,7 @@ _CASUAL_EXTRA = [
 
 
 def is_casual_smalltalk(query: str) -> bool:
-    """判断是否为寒暄/短句闲聊，这类消息跳过 L2/L3 向量检索以节省 embedding 调用。
+    """判断是否为寒暄/短句闲聊，这类消息跳过记忆检索以节省 embedding 调用。
 
     规则：长度 ≤ 28 字符 + 匹配寒暄模式。
     超过 28 字符的消息即使包含"你好"也不跳过（可能是实际内容）。
@@ -154,7 +154,7 @@ def needs_profile_archive(query: str) -> bool:
     """判断是否为深度谈心/人生经历类问题，需注入 Profile 人物履历归档块。
 
     这种问题不是日常闲聊，而是用户希望 Agent 了解自己的性格、经历、
-    人生故事，因此需要启用低频的画像归档（日常以 L0 核心事实优先）。
+    人生故事，因此需要启用低频的画像归档（日常以核心事实优先）。
 
     Args:
         query: 用户消息文本
@@ -178,9 +178,14 @@ def needs_profile_archive(query: str) -> bool:
     return False
 
 
-def needs_l3_recall(query: str) -> bool:
-    """兼容别名：判断是否需要 L3 长期记忆检索（等同 has_recall_intent）。"""
+def needs_memory_recall(query: str) -> bool:
+    """判断是否需要长期记忆检索（等同 has_recall_intent）。"""
     return has_recall_intent(query)
+
+
+def needs_memory_recall(query: str) -> bool:
+    """已废弃：请使用 needs_memory_recall。"""
+    return needs_memory_recall(query)
 
 
 def has_recall_intent(query: str) -> bool:
@@ -198,8 +203,8 @@ def is_identity_question(query: str) -> bool:
     """判断是否为身份类问题（"我是谁/你记得我吗/我叫什么"）。
 
     这类问题有特殊性：
-    - 优先依赖 L0 核心记忆（身份事实）和 L2 近期摘要
-    - 不应使用 L3 中的自称噪声（可能包含不同人的名字）
+    - 优先依赖核心事实（身份事实）和近期摘要
+    - 不应使用长期记忆中的自称噪声（可能包含不同人的名字）
     - 无明确答案时应坦诚说"不记得"，而非罗列矛盾名字
     """
     q = query.strip()
@@ -213,16 +218,24 @@ def is_identity_question(query: str) -> bool:
     )
 
 
-def memory_l3_texts(memory: dict | None) -> list[str]:
-    """从召回结果中提取 L3 文本列表（兼容旧 semantic 字段名）。"""
+def memory_recalled_texts(memory: dict | None) -> list[str]:
+    """从召回结果中提取长期记忆文本列表（基于 diagnostics.long_term）。"""
     mem = memory or {}
-    return list(mem.get("l3") or mem.get("semantic") or [])
+    diag = mem.get("diagnostics") or {}
+    long_term = diag.get("long_term") or []
+    texts = [
+        str(m.get("text", ""))
+        for m in long_term
+        if isinstance(m, dict) and str(m.get("text", "")).strip()
+    ]
+    return texts
 
 
-def memory_l3_hit(memory: dict | None) -> bool:
-    """判断本轮召回中 L3 是否命中（兼容旧 facts_hit 字段）。"""
+def memory_long_term_hit(memory: dict | None) -> bool:
+    """判断本轮召回中长期记忆是否命中（基于 diagnostics.has_long_term）。"""
     mem = memory or {}
-    return bool(mem.get("l3_hit") or mem.get("facts_hit"))
+    diag = mem.get("diagnostics") or {}
+    return bool(diag.get("has_long_term"))
 
 
 # 问机器人自身 —— 应从 persona 回答，不需要查用户记忆
@@ -235,7 +248,7 @@ _SELF_REFERENTIAL = re.compile(
 def query_needs_memory_answer(query: str) -> bool:
     """综合判断本轮是否需要记忆支撑回答。
 
-    这是召回门控的核心判断函数——决定是否调用 L3 检索、是否标记 memory_miss。
+    这是召回门控的核心判断函数——决定是否调用记忆检索、是否标记 memory_miss。
 
     决策逻辑（按优先级）：
       1. 空消息 → 不需要
@@ -300,7 +313,7 @@ _QUERY_STOP_TERMS = frozenset({
 
 _UNKNOWN_GF = (
     "这事儿我真没印象，你跟我讲讲呗？",
-    "记忆库里没翻到这段，你说说是哪件？",
+    "我这边没想起这段，你说说是哪件？",
     "这个我不太记得了，你再提示我一下？",
 )
 _UNKNOWN_VISITOR = (
@@ -339,14 +352,15 @@ def _extract_month_section(text: str, mk: str) -> str:
 
 def memory_evidence_supports_query(user_msg: str, memory: dict) -> bool:
     """检索结果是否足以支撑回答（防止弱相关 chunk 诱发编造）。"""
+    diag = memory.get("diagnostics") or {}
     if is_identity_question(user_msg):
-        if memory.get("l0"):
+        if diag.get("core_memory_count", 0) > 0:
             return True
-        return bool(memory.get("l2_hit") or memory.get("l3_hit"))
+        return bool(diag.get("has_long_term") or diag.get("has_recent"))
 
-    l3_items = (memory.get("matches") or {}).get("l3") or []
-    l2_items = [
-        m for m in ((memory.get("matches") or {}).get("l2") or [])
+    long_term_items = diag.get("long_term") or []
+    recent_items = [
+        m for m in (diag.get("recent") or [])
         if m.get("score") is not None
     ]
 
@@ -355,7 +369,7 @@ def memory_evidence_supports_query(user_msg: str, memory: dict) -> bool:
         year, mo = month
         mk = f"{year}-{mo:02d}"
         sections: list[str] = []
-        for m in l3_items:
+        for m in long_term_items:
             sec = _extract_month_section(str(m.get("text", "")), mk)
             if sec:
                 sections.append(sec)
@@ -374,8 +388,8 @@ def memory_evidence_supports_query(user_msg: str, memory: dict) -> bool:
             return True
         return any(t in combined for t in terms)
 
-    blobs: list[str] = [str(m.get("text", "")) for m in l3_items]
-    blobs.extend(str(m.get("text", "")) for m in l2_items)
+    blobs: list[str] = [str(m.get("text", "")) for m in long_term_items]
+    blobs.extend(str(m.get("text", "")) for m in recent_items)
     if not blobs:
         return False
 
@@ -396,11 +410,11 @@ def memory_miss_level(memory: dict) -> int:
     """
     if not memory.get("memory_miss"):
         return 0
+    diag = memory.get("diagnostics") or {}
     has_any = bool(
-        (memory.get("matches") or {}).get("l2")
-        or (memory.get("matches") or {}).get("l3")
-        or memory.get("episodic")
-        or memory.get("l3")
+        diag.get("recent")
+        or diag.get("long_term")
+        or diag.get("related")
     )
     return 1 if has_any else 2
 
@@ -432,14 +446,14 @@ def build_unknown_reply(
         asked = asked.rstrip("吗嘛呢啊呀")
         if interlocutor_mode == "visitor":
             return f"关于{asked}的我真不太熟，记忆里没有，你跟我说说？"
-        return f"关于{asked}的事儿我记忆库里真没有，你知道的话跟我说说？"
+        return f"关于{asked}的事儿我真没什么印象，你知道的话跟我说说？"
 
     month = _parse_query_month_label(msg)
     if month:
         year, mo = month
         if interlocutor_mode == "visitor":
             return f"{year}年{mo}月的事儿我这边没记录，你跟我讲讲？"
-        return f"{year}年{mo}月那段我翻翻记忆也没有，你跟我回忆一下？"
+        return f"{year}年{mo}月那段我没怎么想起来，你跟我回忆一下？"
 
     pool = _UNKNOWN_VISITOR if interlocutor_mode == "visitor" else _UNKNOWN_GF
     return random.choice(pool)
@@ -481,7 +495,7 @@ _NAME_TOKEN = re.compile(r"[一-鿿]{2,4}")
 # 自称噪声模板：LLM 生成的"本轮用户自称"等套话
 _SELF_INTRO_FACT = re.compile(r"对话中用户自称|用户自称「|本轮用户自称")
 
-# 已确认人物标记：L3 语料中出现了这些词才算"认识"
+# 已确认人物标记：长期记忆中出现了这些词才算"认识"
 _KNOWN_PERSON_MARKERS = re.compile(
     r"女朋友|女友|老婆|男朋友|男友|是叶鹏祥的|叶鹏祥的|认识|在一起|同学|同事"
 )
@@ -491,11 +505,11 @@ _KNOWN_PERSON_MARKERS = re.compile(
 
 ANTI_HALLUCINATION_RULES = """## 事实原则（记住：你是叶鹏祥，不是记忆查询工具）
 
-- 说话时记忆是辅助参考，不是脚本。先做人，再做记忆检索
+- 说话时记忆是辅助参考，不是脚本。先做人，再回忆
 - 记忆里没有的，用你自己的口吻诚实说，可以追问但不要编造。别用"记忆库里没有"这种机器人话——你是人，说"我不太记得了""你提醒我一下"就好
 - 不要把对方本条刚说的当成早就知道的事。不认识就是不认识，别装熟人
 - 禁止根据名字相近就推断关系（如刘远航≠刘远慧的姐姐）
-- L0 禁忌类条目生成回复前必须检查，任何情况下不得触碰
+- 明确写过的禁忌和边界，任何情况下不得触碰
 - 消息中 [对方] 开头的是用户说的，[你] 开头的是你自己说过的话——别把自己的话当成用户的话来回复"""
 
 
@@ -558,9 +572,9 @@ def extract_self_name(msg: str) -> str | None:
     """从"我是XXX"中提取用户自称名。
 
     这是最核心的身份识别函数之一，用于：
-      - L3 检索 query 改写（用自称名替代代词做更精准的检索）
+      - 记忆检索 query 改写（用自称名替代代词做更精准的检索）
       - 反幻觉提示生成（判断此次自称是否已有记忆记录）
-      - L0 即时捕获（capture_l0_from_user_message 调用）
+      - 核心事实即时捕获
 
     Args:
         msg: 用户原始消息
@@ -583,27 +597,27 @@ def extract_self_name(msg: str) -> str | None:
     return who
 
 
-def is_self_intro_only_fact(fact: str) -> bool:
+def is_self_intro_only_fact(text: str) -> bool:
     """判断是否为纯自称噪声——"本轮用户自称XXX"类模板文本。
 
     这类文本是 LLM 生成的套话格式，不能作为"认识此人"的依据。
-    包含此类模板的 L3 记忆块不应被当作身份证据。
+    包含此类模板的记忆块不应被当作身份证据。
     """
-    return bool(_SELF_INTRO_FACT.search(fact))
+    return bool(_SELF_INTRO_FACT.search(text))
 
 
-def is_noise_memory_for_l3(text: str) -> bool:
-    """L3/Facts 噪声过滤：判断一段 L3 记忆文本是否为无意义的噪声。
+def is_noise_memory(text: str) -> bool:
+    """噪声过滤：判断一段记忆文本是否为无意义的噪声。
 
     噪声类型包括：
       - 纯自称套话（"对话中用户自称XXX"）
       - 元指令文本（"仅用户说明为准/勿自动推断"）
       - 自称模板 + 短文本（< 80 字符）——内容太短不足以构成有意义的记忆
 
-    这些噪声块不应参与 L3 召回结果。
+    这些噪声块不应参与召回结果。
 
     Args:
-        text: L3 记忆文本
+        text: 记忆文本
 
     Returns:
         True 表示是噪声，应被过滤掉。
@@ -621,14 +635,14 @@ def is_noise_memory_for_l3(text: str) -> bool:
 
 
 def prune_self_intro_noise(device_id: str) -> int:
-    """清理 L3 存储中的自称噪声块（维护用）。
+    """清理统一记忆库中的自称噪声项（维护用）。
 
-    扫描并删除所有包含"本轮用户自称/对话中用户自称"模板的 chunk。
+    扫描并删除所有包含"本轮用户自称/对话中用户自称"模板的记忆项。
     """
     n = 0
     for sub in ("本轮用户自称", "对话中用户自称"):
-        for ref in store.l3_find_chunks_by_text(sub, device_id=device_id, limit=20):
-            if store.l3_delete_chunk(ref["chunk_id"]):
+        for ref in store.search_memory_items(device_id, kinds=["fact", "entity", "wiki"], query=sub, limit=20):
+            if store.delete_memory_item(ref.get("id", "")):
                 n += 1
     return n
 
@@ -691,13 +705,13 @@ def name_known_in_memory(
 
     检查层次：
       1. 画像匹配：person_profile 有实质内容且名字匹配 → 认识
-      2. 记忆文本匹配：L2 摘要或 L3 语料中包含名字 + 关系类关键词 → 认识
-      3. L3 数据库直接查询：按 person_id 查 L3，逐一排除噪声 → 有则认识
+      2. 记忆文本匹配：近期摘要或长期记忆中包含名字 + 关系类关键词 → 认识
+      3. 统一记忆库直接查询：按 person_id 查长期记忆，逐一排除噪声 → 有则认识
 
     Args:
         device_id:      设备标识
         name:           待检查的名字
-        memory:         本轮召回的记忆数据（含 episodic 和 L3 文本）
+        memory:         本轮召回的记忆数据（含近期和长期记忆文本）
         person_profile: 当前用户的画像（可选）
         person_id:      当前活跃的用户 ID（可选）
 
@@ -716,18 +730,17 @@ def name_known_in_memory(
             return True
 
     # 第二关：记忆召回文本中找名字
-    # 收集所有 L2/L3 文本片段
+    # 收集所有记忆文本片段
+    diag = (memory or {}).get("diagnostics") or {}
     blob_parts: list[str] = []
-    blob_parts.extend(memory.get("episodic") or [])
-    blob_parts.extend(memory_l3_texts(memory))
-    for layer in (memory.get("matches") or {}).values():
-        if isinstance(layer, list):
-            for item in layer:
-                if isinstance(item, dict):
-                    blob_parts.append(str(item.get("text", "")))
-                else:
-                    blob_parts.append(str(item))
-    blob = "\n".join(blob_parts)
+    for layer_name in ("recent", "long_term", "related"):
+        for item in (diag.get(layer_name) or []):
+            if isinstance(item, dict):
+                blob_parts.append(str(item.get("text", "")))
+            else:
+                blob_parts.append(str(item))
+    blob_parts.extend(memory_recalled_texts(memory))
+    blob = "\n".join(p for p in blob_parts if p)
 
     if _name_in_text_blob(name, blob):
         for part in blob_parts:
@@ -742,13 +755,13 @@ def name_known_in_memory(
             if len(name) >= 3:
                 return True
 
-    # 第三关：L3 数据库精确查询（更可靠的来源验证）
+    # 第三关：统一记忆库精确查询（更可靠的来源验证）
     pid = str(person_id or (person_profile or {}).get("person_id") or "").strip()
     if pid:
-        for row in store.l3_list_person_memory(pid, device_id=device_id, limit=40):
-            fact = str(row.get("text", ""))
+        for row in store.search_long_term_memory(pid, limit=40):
+            fact = str(row.get("content", ""))
             # 跳过噪声块
-            if is_self_intro_only_fact(fact) or is_noise_memory_for_l3(fact):
+            if is_self_intro_only_fact(fact) or is_noise_memory(fact):
                 continue
             if _name_in_text_blob(name, fact) and (
                 _KNOWN_PERSON_MARKERS.search(fact) or "关系" in fact or "是其" in fact
@@ -773,7 +786,7 @@ def user_message_hints(
     覆盖场景（按检测顺序）：
       1. 用户纠错（打错了/说错了） → 提示只接受纠正后信息
       2. 纠正长期记忆（记错了/没这回事） → 提示勿重复旧记忆
-      3. 身份追问（我是谁/你记得我吗） → 提示优先 L0/L2，勿罗列矛盾名字
+      3. 身份追问（我是谁/你记得我吗） → 提示优先核心事实和近期摘要，勿罗列矛盾名字
       4. 询问第三方（你认识XXX吗） → 提示"不是用户在自称XXX"
       5. 自称且记忆有记录 → 提示可正常对话但勿编造
       6. 自称但记忆无记录 → 提示"禁止假装认识"，触发访客对待
@@ -812,11 +825,11 @@ def user_message_hints(
         )
 
     # 场景 3：身份追问（我是谁/你记得我吗）
-    # 特殊性：不能用 L3 中的自称噪声（可能是不同人的名字），应优先 L0 + L2
+    # 特殊性：不能用长期记忆中的自称噪声（可能是不同人的名字），应优先核心事实 + 近期摘要
     if is_identity_question(msg):
         lines.append(
-            "【本条】用户在问「我是谁/你记得我吗」：优先依据 **L0 核心记忆**、"
-            "**L2 近7天会话摘要**、已确认事实；"
+            "【本条】用户在问「我是谁/你记得我吗」：优先依据稳定身份事实、"
+            "近期会话摘要和已确认事实；"
             "无则坦诚不记得并请对方说明；禁止罗列互相矛盾的多个自称名。"
         )
 
@@ -826,16 +839,16 @@ def user_message_hints(
         asked = extract_asked_person_name(msg)
         if asked:
             corpus_known = any(
-                name_in_memory_text(asked, str(s)) for s in memory_l3_texts(mem)
+                name_in_memory_text(asked, str(s)) for s in memory_recalled_texts(mem)
             )
             if corpus_known:
                 lines.append(
-                    f"【本条】用户在问「认不认识 {asked}」：记忆库中有关于 {asked} 的内容，"
+                    f"【本条】用户在问「认不认识 {asked}」：你记得一些关于 {asked} 的内容，"
                     f"按记忆回答；**不是**用户在自称 {asked}。"
                 )
             else:
                 lines.append(
-                    f"【本条】用户在问「认不认识 {asked}」：按记忆库回答对该人的了解；"
+                    f"【本条】用户在问「认不认识 {asked}」：只按你确实记得的内容回答；"
                     f"**不是**用户在自称 {asked}；禁止回复「你谁」混淆成对说话人追问。"
                     f"若无记忆则说对 {asked} 没印象/不太熟，勿编造。"
                 )
@@ -845,21 +858,21 @@ def user_message_hints(
     if who:
         known = name_known_in_memory(device_id, who, mem, person_profile=person_profile)
         if not known:
-            # 二次确认：直接搜索 L3 文本中是否有该名字
-            for s in memory_l3_texts(mem):
+            # 二次确认：直接搜索长期记忆中是否有该名字
+            for s in memory_recalled_texts(mem):
                 if name_in_memory_text(who, str(s)):
                     known = True
                     break
         if known:
             # 场景 5：记忆中有记录 → 可以自然对话
             lines.append(
-                f"【本条】用户自称「{who}」：检索到与此人相关的记忆，可自然对话但勿编造记忆未写明的细节。"
+                f"【本条】用户自称「{who}」：你记得与此人相关的内容，可自然对话但勿编造记忆未写明的细节。"
             )
         else:
             # 场景 6：记忆中没有记录 → 执行访客模式对待
             # 这是反幻觉最关键的场景：禁止假装认识
             lines.append(
-                f"【本条】用户自称「{who}」，但 L2/L3/已入库事实/画像中**此前均无此人**。"
+                f"【本条】用户自称「{who}」，但近期摘要、长期记忆、已入库事实和画像中此前均无此人。"
                 f"**禁止**假装认识（好久不见、记得你、老熟人、咱上次…）；"
                 f"可口语表示没印象，让对方自我介绍一下；"
                 f"勿编造任何与 {who} 相关的经历、关系、约定。"
@@ -879,15 +892,16 @@ def user_message_hints(
 
     # 场景 9：记忆未命中但用户在追问
     if re.search(r"记得吗|还记得|有没有印象|认识我吗|你知道我", msg):
-        if not memory_l3_hit(mem) and not mem.get("l2_hit"):
+        diag = mem.get("diagnostics") or {}
+        if not memory_long_term_hit(mem) and not diag.get("has_recent", False) and not diag.get("has_recent"):
             lines.append(
-                "【本条】用户在问你是否记得某事/某人，但本轮记忆检索偏弱："
+                "【本条】用户在问你是否记得某事/某人，但你想起的内容很少："
                 "须承认不太记得或请对方补充，禁止编造共同经历。"
             )
 
     if mem.get("memory_miss") and query_needs_memory_answer(msg):
         lines.append(
-            "【本条】记忆检索没找到直接相关的内容："
+            "【本条】你没想起直接相关的内容："
             "诚实说不太记得就好，用你的口吻——可以追问但别编。"
         )
 
@@ -897,7 +911,7 @@ def user_message_hints(
 def format_stored_facts(
     device_id: str, person_id: str | None = None, limit: int = 12
 ) -> str:
-    """格式化已入库 L3 记忆为 prompt 列表（过滤噪声与纯自称）。
+    """格式化已入库长期记忆为 prompt 列表（过滤噪声与纯自称）。
 
     用于 system prompt 或调试信息中展示该用户已掌握的长期记忆。
 
@@ -912,11 +926,11 @@ def format_stored_facts(
     pid = str(person_id or "").strip()
     if not pid:
         return "（尚未绑定对话人，无已入库记忆；勿编造）"
-    rows = store.l3_list_person_memory(pid, device_id=device_id, limit=limit)
+    rows = store.search_long_term_memory(pid, limit=limit)
     lines: list[str] = []
     for r in rows:
-        fact = str(r.get("text", ""))
-        if is_noise_memory_for_l3(fact):
+        fact = str(r.get("content", ""))
+        if is_noise_memory(fact):
             continue
         # 区分纯自称噪声和有效记忆：前者标注出来提醒 LLM
         if is_self_intro_only_fact(fact):
@@ -931,10 +945,10 @@ def format_stored_facts(
 def capture_user_stated_facts(
     device_id: str, person_id: str, session_id: str, user_msg: str
 ) -> list[str]:
-    """用户纠错/澄清语料 → 直接写入 L3 长期记忆。
+    """用户纠错/澄清语料 → 直接写入统一记忆库。
 
     当用户说"其实我叫XXX"、"搞错了，不是我"等纠错性表述时，
-    将完整的用户原话加上结构化的元信息写入 L3，作为修正记录。
+    将完整的用户原话加上结构化的元信息写入统一记忆库，作为修正记录。
 
     如果用户画像是 draft/provisional 状态，写入后尝试触发画像转正。
 
@@ -945,9 +959,9 @@ def capture_user_stated_facts(
         user_msg:   用户原始消息
 
     Returns:
-        已写入 L3 的语料文本列表。
+        已写入统一记忆库的语料文本列表。
     """
-    from app.memory.l3 import ingest_l3_text
+    from app.memory.long_term_memory import store_long_term_text
 
     msg = user_msg.strip()
     if not msg or not str(person_id or "").strip():
@@ -980,7 +994,7 @@ def capture_user_stated_facts(
         return []
 
     corpus = "\n".join(corpus_parts)
-    cid = ingest_l3_text(
+    cid = store_long_term_text(
         device_id,
         person_id,
         corpus,
@@ -1014,7 +1028,7 @@ def girlfriend_tone_active(
     判断依据（三层确认）：
       1. 画像关系为"女朋友/女友/老婆"且画像有实质内容 → 直接启用
       2. 用户消息中提到刘远慧/刘大炮等名字 + 记忆中有此人 → 启用
-      3. L3 语义记忆中出现刘远慧/刘大炮 + 关系标记词 → 启用
+      3. 长期记忆中出现刘远慧/刘大炮 + 关系标记词 → 启用
 
     Args:
         user_message:   用户消息文本
@@ -1040,7 +1054,7 @@ def girlfriend_tone_active(
         ):
             return True
 
-    # 第三层：L3 语义记忆中有相关人名 + 关系标记
+    # 第三层：长期记忆中有相关人名 + 关系标记
     blob = " ".join(memory.get("semantic", []))
     if re.search(r"刘远慧|刘大炮", blob) and _KNOWN_PERSON_MARKERS.search(blob):
         return True

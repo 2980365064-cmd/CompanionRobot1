@@ -92,12 +92,29 @@ async def test_ws() -> bool:
         ack = json.loads(await ws.recv())
         assert ack["type"] == "hello_ack", ack
 
-        # 2. 发送对话消息，验证回复不为空
-        await ws.send(json.dumps({"type": "chat", "message": "你好，今天心情怎么样？"}))
-        reply = json.loads(await ws.recv())
-        assert reply["type"] == "reply", reply
-        assert reply.get("text"), "empty reply"
-        print(f"  chat reply: {reply['text'][:80]}...")
+        # 2. 发送对话消息，兼容流式协议并验证回复不为空
+        await ws.send(json.dumps({
+            "type": "chat",
+            "message": "你好，今天心情怎么样？",
+            "tts": False,
+        }))
+        reply_parts: list[str] = []
+        while True:
+            packet = json.loads(await ws.recv())
+            typ = packet.get("type")
+            if typ == "reply_token":
+                reply_parts.append(str(packet.get("text") or ""))
+            elif typ == "reply":
+                # 气泡文本是向后兼容事件；没有 token 时用它拼接结果。
+                if not reply_parts:
+                    reply_parts.append(str(packet.get("text") or ""))
+            elif typ == "error":
+                raise AssertionError(packet)
+            elif typ == "chat_done":
+                break
+        reply_text = "".join(reply_parts).strip()
+        assert reply_text, "empty reply"
+        print(f"  chat reply: {reply_text[:80]}...")
 
         # 3. 心跳测试（ping/pong）
         await ws.send(json.dumps({"type": "ping"}))

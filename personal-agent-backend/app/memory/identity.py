@@ -14,9 +14,9 @@
        │        用户"不是/取消"        │
        └──────────────────────────────┘
 
-  guest (tmp_*)    → L1 only；每轮口语引导实名；不调用 embedding
+  guest (tmp_*)    → 工作上下文 only；每轮口语引导实名；不调用 embedding
   pending          → 已解析名字+ID，等待用户发送"是/对"确认
-  verified (非tmp) → L0/L2/L3/Profile 全部可用
+  verified (非tmp) → 核心事实/近期记忆/长期记忆/Profile 全部可用
 
 身份注册规则：
   - ID 由用户自定义（2-64 位字母数字 + _ -），系统不会自动生成正式 ID
@@ -328,7 +328,7 @@ def _bind_verified(
       3. 清除 pending 注册状态（确认/绑定后 pending 失效）
 
     返回值 guest_mode=False 表示当前会话从访客模式切换为已实名模式，
-    agent 模块据此启用 L0/L2/L3 检索。
+    agent 模块据此启用 核心事实/近期记忆/长期记忆 检索。
     """
     store.set_session_active_person(session_id, person_id)
     store.reset_guest_turn_count(session_id)
@@ -343,15 +343,16 @@ def _bind_verified(
     )
 
 
-def ensure_guest_person_id(session_id: str) -> str:
-    """确保会话有一个访客 ID（如果已有则复用，没有则新建）。
+def ensure_guest_person_id(session_id: str, *, replace_verified: bool = False) -> str:
+    """确保会话有一个访客 ID。
 
-    访客 ID 生命周期：一次会话有效，会话结束后作废。
+    ``replace_verified`` 仅用于用户主动开始身份登记或切换访客角色时，
+    让会话脱离此前的已实名对象，避免错误继承其记忆。
     """
     active = store.get_session_active_person_id(session_id)
     if active and is_temp_person_id(active):
         return active
-    if active and is_verified_person_id(active):
+    if active and is_verified_person_id(active) and not replace_verified:
         return active
     tmp = new_temp_person_id()
     store.set_session_active_person(session_id, tmp)
@@ -405,13 +406,13 @@ def resolve_identity_turn(
                     f"【身份入库成功 · 用口语回应】"
                     f"用户确认了身份：{pending['name']}（ID:{pending['person_id']}）。"
                     f"你自然回复一句，像「好嘞{ pending['name'] }，记住了～」"
-                    f"之后正常接话。这是已实名用户，你有权限访问 L0/L2/L3/画像了。"
+                    f"之后正常接话。这是已实名用户，你有权限访问 核心事实/近期记忆/长期记忆/画像了。"
                 ),
             )
         except ValueError as exc:
             _save_pending(session_id, None)
             return IdentityTurnResult(
-                person_id=ensure_guest_person_id(session_id),
+                person_id=ensure_guest_person_id(session_id, replace_verified=True),
                 guest_mode=True,
                 hint=_hint_bind_failure_register(str(exc)),
             )
@@ -420,18 +421,18 @@ def resolve_identity_turn(
     if pending and _DENY.match(msg):
         _save_pending(session_id, None)
         return IdentityTurnResult(
-            person_id=ensure_guest_person_id(session_id),
+            person_id=ensure_guest_person_id(session_id, replace_verified=True),
             guest_mode=True,
             hint=(
                 "【身份已取消】用户说不是，取消了刚才的注册。"
-                "自然接一句，后半段仍可顺口问名字+ID。仍按访客模式（仅 L1）。"
+                "自然接一句，后半段仍可顺口问名字+ID。仍按访客模式（仅 工作上下文）。"
             ),
         )
 
     # 分支 3：待确认 + 用户没做确认/否认 → 继续用口语追问
     if pending and not parse_identity_credentials(msg):
         return IdentityTurnResult(
-            person_id=ensure_guest_person_id(session_id),
+            person_id=ensure_guest_person_id(session_id, replace_verified=True),
             guest_mode=True,
             pending_registration=pending,
             hint=f"""【待确认新身份 · 你必须在本轮回复中口语确认】
@@ -457,7 +458,7 @@ def resolve_identity_turn(
                 )
             # 4b：ID 对但名字错 → 拒绝
             return IdentityTurnResult(
-                person_id=ensure_guest_person_id(session_id),
+                person_id=ensure_guest_person_id(session_id, replace_verified=True),
                 guest_mode=True,
                 hint=_hint_bind_failure_id_name_mismatch(pid, stored_name, name),
                 monitor_event=f"身份校验失败 · ID对名错 id={pid[:12]}",
@@ -467,7 +468,7 @@ def resolve_identity_turn(
         if by_name:
             stored_pid = str(by_name.get("person_id") or "").strip()
             return IdentityTurnResult(
-                person_id=ensure_guest_person_id(session_id),
+                person_id=ensure_guest_person_id(session_id, replace_verified=True),
                 guest_mode=True,
                 hint=_hint_bind_failure_name_id_mismatch(name, stored_pid),
                 monitor_event=f"身份校验失败 · 名对ID错 id={stored_pid[:12]}",
@@ -476,7 +477,7 @@ def resolve_identity_turn(
         pending_new = {"name": name, "person_id": pid}
         _save_pending(session_id, pending_new)
         return IdentityTurnResult(
-            person_id=ensure_guest_person_id(session_id),
+            person_id=ensure_guest_person_id(session_id, replace_verified=True),
             guest_mode=True,
             pending_registration=pending_new,
             hint=f"""【新身份待确认 · 你必须在本轮回复中口语确认】
@@ -512,14 +513,14 @@ def resolve_identity_turn(
         person_id=guest_pid,
         guest_mode=True,
         hint=guest_identity_nudge_for_turn(turn),
-        monitor_event="访客 L1" if turn == 1 else "",
+        monitor_event="访客 工作上下文" if turn == 1 else "",
     )
 
 
 def resolve_person_before_memory(
     device_id: str, session_id: str, message: str,
 ) -> tuple[str | None, dict | None, str, bool, str]:
-    """兼容旧接口：包装 resolve_identity_turn 返回元组。
+    """为对话入口返回身份解析元组。
 
     Returns:
         (person_id, person_profile, hint, guest_mode, monitor_event)
@@ -534,8 +535,8 @@ def resolve_person_before_memory(
 def memory_scoped_to_person(person_id: str | None) -> bool:
     """判断记忆检索是否应限定到特定用户（= 非访客）。
 
-    这是 router 模块的入口门控：为 True 时启用 L0/L2/L3 检索，
-    为 False 时仅返回 L1（当前会话窗口），节省 embedding API 费用。
+    这是 router 模块的入口门控：为 True 时启用 核心事实/近期记忆/长期记忆 检索，
+    为 False 时仅返回 工作上下文（当前会话窗口），节省 embedding API 费用。
     """
     return is_verified_person_id(person_id)
 
@@ -570,10 +571,6 @@ def guest_identity_nudge_for_turn(turn: int) -> str:
 本轮风格：{angle}。让对方发「名字+ID」即可，ID随便起，如「刘远慧 123」。
 **禁止复读**之前任何一轮的问法；禁止「请您」「实名」「绑定」「登记」等客服词。
 每轮都要问，像微信朋友顺口一句。"""
-
-
-# 兼容旧引用
-GUEST_IDENTITY_CASUAL_NUDGE = guest_identity_nudge_for_turn(1)
 
 
 def _hint_bind_failure_id_name_mismatch(pid: str, stored_name: str, claimed_name: str) -> str:

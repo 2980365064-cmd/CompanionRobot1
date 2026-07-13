@@ -2,7 +2,7 @@
 """微信聊天记录导入工具：TXT 导出 → persona/import/drafts/ 草稿 → corpus/ 语料。
 
 用途：将微信导出的 .txt 聊天记录（单聊或群聊）转换为陪伴机器人可识别的语料格式，
-包括口吻范例草稿和按月汇总的长期记忆摘要，最终写入 persona/corpus/ 目录供 L3 入库。
+包括口吻范例草稿和按月汇总的长期记忆摘要，最终写入 persona/corpus/ 目录供 长期记忆 入库。
 
 数据流：
   微信 TXT → 解析消息行 → 合并为对话块 → 提取 Q→A 对（口吻草稿）
@@ -769,7 +769,7 @@ def write_memory_corpus(
     """将消息按月汇总为第一人称回忆叙事，写入 corpus/ 长期记忆文件。
 
     这是整个导入流程的核心输出步骤，生成的 .md 文件将被
-    scripts/ingest.py 入库到 L3 向量搜索引擎。
+    scripts/ingest.py 入库到 长期记忆 向量搜索引擎。
 
     处理流程：
     1. 将消息按月份分组
@@ -801,7 +801,7 @@ def write_memory_corpus(
     }
 
     # 构建文件头（标题 + 前言 + 身份约定说明）
-    lines = [f"# {title_map.get(mode, '微信记忆')}（L3 长期记忆）", ""]
+    lines = [f"# {title_map.get(mode, '微信记忆')}（长期记忆 长期记忆）", ""]
     if preamble:
         lines.extend(preamble)
         lines.append("")

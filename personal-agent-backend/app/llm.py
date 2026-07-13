@@ -171,7 +171,7 @@ def _fallback_embed(text: str, dim: int = 256) -> list[float]:
       - SHA256 输出 32 字节（256 位），每个字节值域 [0, 255]
       - (b / 127.5) - 1.0 线性映射到 [-1, 1]
       - 当 dim > 32 时，digest[i % 32] 循环复用字节（不是密码学安全操作，但向量维度只需近似分布）
-      - 最终 L2 归一化使所有 fallback 向量模长相同，余弦相似度 = 内积
+      - 最终 近期记忆 归一化使所有 fallback 向量模长相同，余弦相似度 = 内积
 
     仅在未配置 EMBED_API_KEY 时使用，生产环境不推荐。
     """
@@ -181,7 +181,7 @@ def _fallback_embed(text: str, dim: int = 256) -> list[float]:
         b = digest[i % len(digest)]
         vals.append((b / 127.5) - 1.0)  # 映射到 [-1, 1]
     norm = math.sqrt(sum(v * v for v in vals)) or 1.0
-    return [v / norm for v in vals]  # L2 归一化
+    return [v / norm for v in vals]  # 近期记忆 归一化
 
 
 def _chat_completion_raw(
@@ -307,18 +307,22 @@ async def chat_completion_stream_async(
         async for token in chat_completion_stream_async(messages):
             ...
     """
+    loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
+
+    def _put(kind: str, payload: str | None) -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, (kind, payload))
 
     def _run() -> None:
         try:
             for token in chat_completion_stream(messages, temperature=temperature):
-                queue.put_nowait(("token", token))
+                _put("token", token)
         except Exception as exc:
-            queue.put_nowait(("error", str(exc)))
+            _put("error", str(exc))
         finally:
-            queue.put_nowait(("done", None))
+            _put("done", None)
 
-    task = asyncio.get_event_loop().run_in_executor(None, _run)
+    task = loop.run_in_executor(None, _run)
     try:
         while True:
             kind, payload = await queue.get()
@@ -343,7 +347,7 @@ def chat_completion_small(messages: list[dict], *, temperature: float = 0.1, max
         让调用方（如 extractor）优雅降级
 
     典型使用场景：
-      - L1→L2 会话摘要压缩
+      - 工作上下文压缩
       - Facts 提取（从对话中抽取结构化事实）
       - 记忆修正（判断用户是否在纠正之前的记忆）
       - 画像更新（从对话中提取人物信息）
@@ -385,7 +389,7 @@ def cosine_similarity(a: Iterable[float], b: Iterable[float]) -> float:
     返回:
         float: 余弦相似度值，1.0 表示完全相同，0.0 表示正交
 
-    用于记忆召回阶段比较用户查询向量与 L2/L3 记忆向量的相似度。
+    用于记忆召回阶段比较用户查询向量与 近期记忆/长期记忆 记忆向量的相似度。
     """
     av = a if isinstance(a, list) else list(a)
     bv = b if isinstance(b, list) else list(b)

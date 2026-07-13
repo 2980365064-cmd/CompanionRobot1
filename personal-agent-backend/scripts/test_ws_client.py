@@ -108,11 +108,42 @@ async def run_client(uri: str, token: str, device_id: str) -> None:
             # 发送对话消息
             # ensure_ascii=False 确保中文不被转义为 \\uXXXX
             await ws.send(json.dumps({"type": "chat", "message": user_input}, ensure_ascii=False))
-            reply = json.loads(await ws.recv())
-            print(f"Bot> {reply.get('text', reply)}\n")
-            # 更新 session_id（服务器可能在回复中返回新的 session_id）
-            if reply.get("session_id"):
-                session_id = reply["session_id"]
+            reply_text = []
+            while True:
+                raw = await ws.recv()
+                if isinstance(raw, bytes):
+                    print(f"<< binary {len(raw)} bytes")
+                    continue
+
+                frame = json.loads(raw)
+                frame_type = frame.get("type")
+                if frame.get("session_id"):
+                    session_id = frame["session_id"]
+
+                if frame_type == "reply_start":
+                    print("Bot> ", end="", flush=True)
+                elif frame_type == "reply_token":
+                    text = frame.get("text", "")
+                    reply_text.append(text)
+                    print(text, end="", flush=True)
+                elif frame_type == "reply":
+                    text = frame.get("text", "")
+                    if not reply_text:
+                        reply_text.append(text)
+                        print(text, end="", flush=True)
+                elif frame_type == "follow_up":
+                    print(f"\nFollow-up> {frame.get('text', '')}", flush=True)
+                elif frame_type == "error":
+                    print(f"\nError> {frame}", flush=True)
+                elif frame_type == "chat_done":
+                    if reply_text:
+                        print()
+                    else:
+                        print(f"<< {json.dumps(frame, ensure_ascii=False)}")
+                    print()
+                    break
+                else:
+                    print(f"\n<< {json.dumps(frame, ensure_ascii=False)}", flush=True)
 
 
 def main() -> None:
