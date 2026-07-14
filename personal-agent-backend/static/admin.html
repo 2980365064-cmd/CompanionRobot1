@@ -1,0 +1,1424 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SparkBot 后台管理</title>
+<link rel="icon" href="data:," />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700&display=swap" rel="stylesheet" />
+<script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
+<style>
+:root {
+  --bg: #101713;
+  --bg-2: #141f1a;
+  --panel: #19231f;
+  --panel-2: #202d28;
+  --panel-3: #263630;
+  --line: rgba(215, 235, 225, 0.11);
+  --text: #edf7f2;
+  --text-2: #c8d8d0;
+  --muted: #83968e;
+  --accent: #77d7b2;
+  --accent-2: #8ebeff;
+  --warn: #e9c46a;
+  --err: #ff7e78;
+  --ok: #8ce8b4;
+  --shadow: 0 22px 70px rgba(0, 0, 0, 0.28);
+  --radius-xl: 24px;
+  --radius-lg: 18px;
+  --radius-md: 14px;
+  --radius-sm: 10px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  min-height: 100vh;
+  font-family: "DM Sans", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  color: var(--text);
+  background:
+    radial-gradient(circle at 22% 4%, rgba(119, 215, 178, .10), transparent 30%),
+    radial-gradient(circle at 86% 18%, rgba(142, 190, 255, .10), transparent 32%),
+    linear-gradient(135deg, #0f1713, #111a17 42%, #17211d);
+  display: flex;
+}
+button, input, textarea, select { font: inherit; }
+button {
+  border: 0; cursor: pointer; color: var(--text); border-radius: 999px;
+  background: var(--panel-3); transition: transform .18s ease, border-color .18s ease, background .18s ease, box-shadow .18s ease;
+}
+button:hover { transform: translateY(-1px); }
+button:disabled { opacity: .45; cursor: default; transform: none; }
+.shell { display: grid; grid-template-columns: 248px 1fr; width: 100%; min-height: 100vh; }
+.sidebar {
+  position: sticky; top: 0; height: 100vh; padding: 22px 14px;
+  border-right: 1px solid var(--line); background: rgba(15, 23, 19, .78);
+  backdrop-filter: blur(22px); display: flex; flex-direction: column; gap: 18px;
+}
+.brand { padding: 4px 8px 14px; border-bottom: 1px solid var(--line); }
+.brand-mark { width: 40px; height: 40px; border-radius: 15px; background: linear-gradient(135deg, #35564a, #76d3b1); margin-bottom: 12px; box-shadow: 0 14px 34px rgba(119,215,178,.18); }
+.brand h1 { font-size: 1.02rem; letter-spacing: 0; }
+.brand p { color: var(--muted); font-size: .74rem; margin-top: 3px; }
+.nav { display: flex; flex-direction: column; gap: 6px; }
+.nav-item {
+  width: 100%; display: grid; grid-template-columns: 30px 1fr; align-items: center; gap: 10px;
+  padding: 10px 11px; border-radius: 15px; background: transparent; color: var(--muted); text-align: left;
+}
+.nav-item:hover { background: rgba(255,255,255,.045); color: var(--text); transform: translateY(-1px) scale(1.01); }
+.nav-item.active { background: linear-gradient(135deg, rgba(119,215,178,.16), rgba(142,190,255,.08)); color: var(--text); box-shadow: inset 0 0 0 1px rgba(119,215,178,.22); }
+.nav-glyph {
+  width: 30px; height: 30px; display: grid; place-items: center; border-radius: 11px;
+  background: rgba(255,255,255,.055); color: var(--accent); font-size: .66rem; font-weight: 800;
+}
+
+/* ── 内联认证提示 ── */
+#authBanner {
+  display: none; position: fixed; top: 0; left: 0; right: 0; z-index: 9999;
+  background: rgba(255,126,120,0.10); color: var(--err);
+  text-align: center; padding: 8px 16px;
+  font-size: 0.72rem; border-bottom: 1px solid rgba(255,126,120,0.18);
+}
+#authBanner.show { display: block; }
+
+.main { min-width: 0; height: 100vh; overflow-y: auto; padding: 28px 34px; }
+.tab { display: none; }
+.tab.active { display: block; animation: fade .18s ease both; }
+@keyframes fade { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
+
+/* ── 概览一屏 ── */
+#tab-overview.active { height: 100vh; overflow: hidden; padding: 0; }
+#tab-overview .scroll-area { height: 100vh; overflow-y: auto; padding: 28px 34px; display: flex; flex-direction: column; gap: 14px; }
+
+.page-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 18px; }
+.page-title { font-size: 1.46rem; font-weight: 800; letter-spacing: 0; }
+.page-desc { color: var(--muted); font-size: .84rem; margin-top: 5px; }
+.grid { display: grid; gap: 14px; }
+.cards-grid { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+.card, .panel, .person-card, .contact-card, .task-card {
+  background: linear-gradient(180deg, rgba(255,255,255,.055), rgba(255,255,255,.032));
+  border: 1px solid var(--line); border-radius: var(--radius-lg); box-shadow: var(--shadow);
+}
+.card { padding: 18px; min-height: 132px; display: flex; flex-direction: column; justify-content: space-between; }
+.card.clickable { cursor: pointer; position: relative; overflow: hidden; }
+.card.clickable::after { content: "打开"; position: absolute; right: 14px; top: 14px; color: var(--muted); font-size: .7rem; opacity: 0; transition: opacity .18s ease; }
+.card.clickable:hover { transform: translateY(-3px) scale(1.012); border-color: rgba(119,215,178,.42); box-shadow: 0 26px 82px rgba(0,0,0,.32); }
+.card.clickable:hover::after { opacity: 1; }
+.label { color: var(--muted); font-size: .72rem; text-transform: uppercase; letter-spacing: .04em; }
+.value { font-size: 1.7rem; font-weight: 800; margin-top: 8px; }
+.sub-text { color: var(--text-2); font-size: .78rem; line-height: 1.45; }
+.ok { color: var(--ok); } .warn { color: var(--warn); } .err { color: var(--err); }
+.toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 14px; }
+.btn { padding: 9px 14px; background: linear-gradient(135deg, #4da889, #77d7b2); color: #082018; font-weight: 800; }
+.btn-ghost { background: rgba(255,255,255,.045); color: var(--text); border: 1px solid var(--line); }
+.btn-danger { background: rgba(255,126,120,.12); color: #ffaaa6; border: 1px solid rgba(255,126,120,.35); }
+.btn-sm { padding: 6px 10px; font-size: .74rem; }
+.field, .select {
+  border: 1px solid var(--line); outline: 0; border-radius: 13px; padding: 9px 11px;
+  background: rgba(0,0,0,.16); color: var(--text); min-height: 38px;
+}
+textarea.field { resize: vertical; min-height: 78px; }
+.panel { padding: 18px; margin-bottom: 16px; }
+.table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius-lg); background: rgba(255,255,255,.035); }
+.ov-table-wrap { overflow: auto; max-height: 200px; }
+table { width: 100%; border-collapse: collapse; font-size: .82rem; }
+th, td { padding: 11px 13px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+th { color: var(--muted); font-size: .7rem; text-transform: uppercase; letter-spacing: .04em; background: rgba(255,255,255,.035); }
+tr:last-child td { border-bottom: 0; }
+tr:hover td { background: rgba(119,215,178,.035); }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .74rem; color: var(--text-2); }
+.tag { display: inline-flex; align-items: center; min-height: 22px; padding: 2px 8px; border-radius: 999px; background: rgba(255,255,255,.07); color: var(--text-2); font-size: .69rem; margin: 2px 4px 2px 0; }
+.tag.accent { color: var(--accent); background: rgba(119,215,178,.12); }
+.person-card, .contact-card, .task-card { padding: 16px; transition: transform .18s ease, border-color .18s ease; }
+.person-card:hover, .contact-card:hover, .task-card:hover { transform: translateY(-2px); border-color: rgba(119,215,178,.35); }
+.name { font-size: 1rem; font-weight: 800; }
+.pid { margin-top: 4px; color: var(--muted); font-size: .72rem; word-break: break-all; }
+.actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
+.memory-group { padding: 0; overflow: hidden; }
+.memory-header { display: flex; justify-content: space-between; gap: 16px; padding: 16px; cursor: pointer; background: rgba(255,255,255,.035); }
+.memory-body { display: none; padding: 16px; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.memory-group.open .memory-body { display: grid; }
+.mini-list { border: 1px solid var(--line); border-radius: 14px; padding: 12px; background: rgba(0,0,0,.1); min-height: 180px; }
+.mini-list h3 { font-size: .84rem; margin-bottom: 10px; color: var(--accent); }
+.mini-item { padding: 9px 0; border-bottom: 1px solid var(--line); color: var(--text-2); font-size: .79rem; line-height: 1.45; }
+.mini-item:last-child { border-bottom: 0; }
+.empty { padding: 28px; color: var(--muted); text-align: center; border: 1px dashed var(--line); border-radius: var(--radius-lg); }
+
+/* ── 控制台 + 健康融合 ── */
+.console-wrap { height: 100%; display: flex; flex-direction: column; background: var(--panel); border-radius: var(--radius-lg); border: 1px solid var(--line); overflow: hidden; }
+.console { flex: 1; overflow-y: auto; padding: 14px; background: #0b110f; color: #c7d7cf; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .74rem; line-height: 1.55; white-space: pre-wrap; word-break: break-all; max-height: 55vh; }
+.console .warn { color: var(--warn); } .console .err { color: var(--err); } .console .highlight { color: var(--accent); }
+.console-status { padding: 4px 12px; border-top: 1px solid var(--line); font-size: 0.62rem; color: var(--muted); display: flex; justify-content: space-between; }
+
+/* ── 健康卡片 ── */
+.health-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; }
+.hcard { background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 10px 12px; }
+.hcard .hl { font-size: 0.65rem; color: var(--muted); }
+.hcard .hv { font-size: 0.8rem; font-weight: 600; margin-top: 2px; }
+.hcard .hv.ok { color: var(--accent); }
+.hcard .hv.err { color: var(--err); }
+
+/* ── 语料分类布局 ── */
+.corpus-layout { display: grid; grid-template-columns: 200px 1fr 1fr; gap: 14px; align-items: start; }
+@media (max-width: 1100px) { .corpus-layout { grid-template-columns: 180px 1fr; } }
+.corpus-groups { max-height: 680px; overflow-y: auto; }
+.corpus-groups .g-item { padding: 8px 10px; border-radius: var(--radius-sm); cursor: pointer; transition: .15s; display: flex; justify-content: space-between; font-size: 0.75rem; color: var(--text-2); }
+.corpus-groups .g-item:hover { background: rgba(119,215,178,.07); }
+.corpus-groups .g-item.active { background: rgba(119,215,178,.12); color: var(--accent); font-weight: 600; }
+.corpus-groups .g-item .cnt { color: var(--muted); font-size: 0.65rem; }
+.corpus-files { max-height: 680px; overflow-y: auto; }
+.corpus-files .f-item { padding: 8px 10px; border-radius: var(--radius-sm); cursor: pointer; transition: .15s; font-size: 0.72rem; color: var(--text-2); border-left: 2px solid transparent; position: relative; }
+.corpus-files .f-item:hover { background: rgba(119,215,178,.07); border-left-color: var(--accent); }
+.corpus-files .f-item.active { background: rgba(119,215,178,.10); color: var(--accent); border-left-color: var(--accent); }
+.corpus-files .f-item .fdesc { display: none; font-size: 0.62rem; color: var(--muted); margin-top: 2px; }
+.corpus-files .f-item:hover .fdesc { display: block; }
+.corpus-editor { display: flex; flex-direction: column; }
+.corpus-editor textarea { flex: 1; min-height: 200px; }
+.corpus-editor .actions { display: flex; gap: 6px; margin-top: 6px; }
+
+/* ── 配置工具提示 ── */
+.config-tooltip {
+  display: none; position: absolute; z-index: 100;
+  background: #0d1411; border: 1px solid var(--line);
+  border-radius: var(--radius-sm); padding: 10px 12px;
+  width: 280px; font-size: 0.72rem; line-height: 1.5;
+  box-shadow: 0 8px 30px rgba(0,0,0,0.5);
+  top: calc(100% + 6px); left: 10px; pointer-events: none;
+}
+.config-card { position: relative; }
+.config-card:hover .config-tooltip { display: block; }
+
+/* ── 危险提醒 ── */
+.danger-banner {
+  display: none; padding: 8px 12px; border-radius: var(--radius-sm);
+  background: rgba(255,126,120,0.08); border: 1px solid rgba(255,126,120,0.2);
+  margin-bottom: 8px; font-size: 0.72rem; color: var(--err);
+}
+.danger-banner.show { display: block; }
+
+/* ── 配置修改摘要 ── */
+.change-summary {
+  display: none; padding: 8px 12px; border-radius: var(--radius-sm);
+  background: rgba(119,215,178,0.08); border: 1px solid rgba(119,215,178,0.2);
+  margin-bottom: 10px; font-size: 0.72rem;
+}
+.change-summary.show { display: block; }
+.change-summary .cs-title { font-weight: 600; color: var(--accent); margin-bottom: 4px; }
+.change-summary .cs-item { color: var(--text-2); }
+
+.nav-label { margin: 10px 9px 4px; color: #60756b; font-size: .64rem; font-weight: 800; text-transform: uppercase; letter-spacing: .08em; }
+.split-layout { display: grid; grid-template-columns: 300px minmax(0,1fr); gap: 14px; align-items: start; }
+.side-list { max-height: 680px; overflow: auto; display: grid; gap: 8px; }
+.list-row { padding: 12px; border: 1px solid var(--line); border-radius: 15px; background: rgba(255,255,255,.035); cursor: pointer; transition: transform .18s ease, border-color .18s ease; }
+.list-row:hover, .list-row.active { transform: translateY(-1px); border-color: rgba(119,215,178,.36); background: rgba(119,215,178,.07); }
+.editor { min-height: 560px; width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; line-height: 1.6; }
+.config-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px,1fr)); gap: 12px; }
+.config-card { padding: 14px; border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.038); }
+.config-card label { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; color: var(--text-2); font-size: .76rem; }
+.config-card input, .config-card select { width: 100%; }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; margin-right: 6px; }
+.status-dot.ok { background: var(--ok); } .status-dot.err { background: var(--err); } .status-dot.warn { background: var(--warn); }
+.ops-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px,1fr)); gap: 14px; }
+.danger-zone { border-color: rgba(255,126,120,.22); background: rgba(255,126,120,.055); }
+.modal-overlay { display: none; position: fixed; inset: 0; z-index: 30; background: rgba(0,0,0,.58); backdrop-filter: blur(10px); align-items: center; justify-content: center; padding: 18px; }
+.modal-overlay.active { display: flex; }
+.modal { width: min(680px, 96vw); max-height: 88vh; overflow: auto; padding: 20px; border-radius: 24px; background: #17221e; border: 1px solid var(--line); box-shadow: var(--shadow); }
+.modal h3 { font-size: 1rem; margin-bottom: 14px; }
+.form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.form-group { display: flex; flex-direction: column; gap: 6px; }
+.form-group.full { grid-column: 1 / -1; }
+.form-group label { color: var(--muted); font-size: .72rem; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+#graphCanvas { height: 720px; border: 1px solid rgba(88,118,105,.24); border-radius: 24px; background: #dfe8df; overflow: hidden; position: relative; box-shadow: 0 28px 86px rgba(0,0,0,.24); }
+#graphCanvas canvas { display: block; }
+.graph-detail { min-height: 480px; padding: 18px; border: 1px solid rgba(88,118,105,.22); border-radius: 22px; background: rgba(217,228,219,.96); color: #46524b; box-shadow: 0 22px 70px rgba(0,0,0,.18); }
+.graph-detail h3 { color: #292d30; font-size: 1.04rem; margin-bottom: 6px; }
+.graph-section { margin-top: 16px; padding-top: 14px; border-top: 1px solid rgba(88,118,105,.2); }
+.graph-section-title { color: #3f4448; font-size: .76rem; font-weight: 800; margin-bottom: 9px; }
+.kv { display: grid; gap: 8px; }
+.kv-row { display: grid; grid-template-columns: 92px 1fr; gap: 10px; font-size: .78rem; line-height: 1.45; }
+.kv-row span:first-child { color: #8a8f94; }
+.memory-snippet { padding: 9px 0; border-bottom: 1px solid rgba(88,118,105,.2); font-size: .78rem; line-height: 1.45; color: #46524b; }
+.memory-snippet:last-child { border-bottom: 0; }
+.graph-layout { display: grid; grid-template-columns: minmax(0, 1fr) 330px; gap: 14px; align-items: start; }
+.graph-stats { margin-top: 14px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.graph-stat { padding: 14px; border: 1px solid rgba(88,118,105,.22); border-radius: 18px; background: rgba(217,228,219,.94); color: #3f4d45; }
+.graph-side { display: grid; gap: 14px; }
+.graph-filter { padding: 14px; border: 1px solid rgba(88,118,105,.22); border-radius: 22px; background: rgba(217,228,219,.96); box-shadow: 0 22px 70px rgba(0,0,0,.18); color: #435047; }
+.filter-grid { display: grid; gap: 8px; }
+.graph-filter .select { width: 100%; background: #cad8ce; color: #2f3c34; border-color: rgba(88,118,105,.28); }
+
+/* ── 加载 ── */
+.spin { width: 18px; height: 18px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; display: inline-block; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.loading { display: flex; align-items: center; gap: 8px; padding: 20px; color: var(--muted); font-size: 0.78rem; }
+
+@media (max-width: 980px) {
+  .shell { grid-template-columns: 1fr; }
+  .sidebar { position: static; height: auto; }
+  .main { height: auto; padding: 18px; }
+  #tab-overview.active { height: auto; overflow: auto; }
+  #tab-overview .scroll-area { height: auto; }
+  .nav { display: grid; grid-template-columns: repeat(2, 1fr); }
+  .memory-body, .graph-layout, .graph-stats, .form-grid, .split-layout { grid-template-columns: 1fr; }
+  .graph-detail { min-height: 320px; }
+}
+@media (max-width: 640px) {
+  body { min-height: 100dvh; display: block; }
+  .shell {
+    display: block;
+    min-height: 100dvh;
+    width: 100%;
+  }
+  .sidebar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    height: auto;
+    padding: 10px 10px 8px;
+    gap: 10px;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+    background: rgba(15, 23, 19, .92);
+  }
+  .brand {
+    display: grid;
+    grid-template-columns: 34px 1fr;
+    align-items: center;
+    column-gap: 10px;
+    padding: 2px 4px 8px;
+  }
+  .brand-mark {
+    width: 34px;
+    height: 34px;
+    border-radius: 13px;
+    margin: 0;
+    grid-row: 1 / span 2;
+  }
+  .brand h1 { font-size: 0.94rem; }
+  .brand p { font-size: 0.68rem; margin-top: 0; }
+  .nav {
+    display: flex;
+    flex-direction: row;
+    gap: 8px;
+    overflow-x: auto;
+    padding: 0 2px 4px;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
+  .nav::-webkit-scrollbar { display: none; }
+  .nav-label { display: none; }
+  .nav-item {
+    width: auto;
+    flex: 0 0 auto;
+    grid-template-columns: 24px auto;
+    gap: 7px;
+    min-height: 42px;
+    padding: 7px 10px;
+    border-radius: 999px;
+    white-space: nowrap;
+  }
+  .nav-glyph {
+    width: 24px;
+    height: 24px;
+    border-radius: 9px;
+    font-size: 0.58rem;
+  }
+  .main {
+    height: auto;
+    min-height: calc(100dvh - 112px);
+    padding: 14px 10px calc(18px + env(safe-area-inset-bottom));
+    overflow: visible;
+  }
+  #tab-overview.active {
+    height: auto;
+    overflow: visible;
+  }
+  #tab-overview .scroll-area {
+    height: auto;
+    overflow: visible;
+    padding: 0;
+    gap: 10px;
+  }
+  .tab.active { animation: fade .14s ease both; }
+  .page-head {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+  .page-head .toolbar { width: 100%; }
+  .page-title { font-size: 1.18rem; }
+  .page-desc { font-size: 0.76rem; }
+  .toolbar {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+  .toolbar .field,
+  .toolbar .select,
+  .toolbar .btn,
+  .toolbar button {
+    width: 100%;
+  }
+  .btn, .btn-sm, button, .field, .select {
+    min-height: 42px;
+  }
+  .btn-sm { padding: 8px 11px; }
+  .cards-grid,
+  .ops-grid,
+  .health-grid,
+  .config-grid {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+  .card {
+    min-height: 104px;
+    padding: 14px;
+  }
+  .value { font-size: 1.36rem; }
+  .panel,
+  .person-card,
+  .contact-card,
+  .task-card {
+    padding: 14px;
+    border-radius: 16px;
+  }
+  #overviewBottom {
+    grid-template-columns: 1fr !important;
+    gap: 10px !important;
+  }
+  .memory-header {
+    flex-direction: column;
+    gap: 10px;
+    padding: 14px;
+  }
+  .memory-body {
+    grid-template-columns: 1fr;
+    padding: 12px;
+    gap: 10px;
+  }
+  .mini-list { min-height: auto; }
+  .split-layout,
+  .corpus-layout,
+  .graph-layout,
+  .graph-stats,
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+  .side-list,
+  .corpus-groups,
+  .corpus-files {
+    max-height: none;
+  }
+  .corpus-groups {
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+    padding-bottom: 4px;
+    -webkit-overflow-scrolling: touch;
+  }
+  .corpus-groups .g-item {
+    flex: 0 0 auto;
+    min-width: 128px;
+    border: 1px solid var(--line);
+  }
+  .corpus-files {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+  .editor {
+    min-height: 38vh;
+    font-size: 0.8rem;
+  }
+  .console-wrap {
+    max-height: none !important;
+  }
+  .console {
+    max-height: 42vh;
+    min-height: 260px;
+    font-size: 0.68rem;
+  }
+  .console-wrap > div:first-child {
+    flex-direction: column;
+    align-items: stretch !important;
+    gap: 8px;
+  }
+  .console-wrap > div:first-child > div {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px !important;
+  }
+  .console-wrap > div:first-child input {
+    grid-column: 1 / -1;
+    width: 100% !important;
+  }
+  .table-wrap,
+  .ov-table-wrap {
+    width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  table {
+    min-width: 620px;
+    font-size: 0.76rem;
+  }
+  th, td {
+    padding: 9px 10px;
+  }
+  #graphCanvas {
+    height: min(58vh, 430px);
+    min-height: 320px;
+    border-radius: 18px;
+  }
+  .graph-side {
+    gap: 10px;
+  }
+  .graph-filter,
+  .graph-detail,
+  .graph-stat {
+    border-radius: 16px;
+    padding: 12px;
+  }
+  .graph-detail {
+    min-height: 220px;
+  }
+  .kv-row {
+    grid-template-columns: 78px 1fr;
+  }
+  .modal-overlay {
+    align-items: flex-end;
+    padding: 8px;
+    padding-bottom: calc(8px + env(safe-area-inset-bottom));
+  }
+  .modal {
+    width: 100% !important;
+    max-height: 92dvh;
+    padding: 16px;
+    border-radius: 22px;
+  }
+  .modal-actions {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+  .modal-actions .btn,
+  .modal-actions button {
+    width: 100%;
+  }
+  #personDetailModal .toolbar {
+    display: flex;
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    padding-bottom: 4px;
+    -webkit-overflow-scrolling: touch;
+  }
+  #personDetailModal .toolbar button {
+    flex: 0 0 auto;
+    width: auto;
+  }
+}
+</style>
+</head>
+<body>
+<div id="authBanner"></div>
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark"></div>
+      <h1>SparkBot</h1>
+      <p>后台管理系统</p>
+    </div>
+    <nav class="nav">
+      <div class="nav-label">数据</div>
+      <button class="nav-item active" data-tab="overview"><span class="nav-glyph">OV</span><span>概览</span></button>
+      <button class="nav-item" data-tab="self"><span class="nav-glyph">SC</span><span>自我认知</span></button>
+      <button class="nav-item" data-tab="persons"><span class="nav-glyph">PF</span><span>人物画像</span></button>
+      <button class="nav-item" data-tab="memory"><span class="nav-glyph">MM</span><span>记忆管理</span></button>
+      <button class="nav-item" data-tab="contacts"><span class="nav-glyph">TP</span><span>第三方画像</span></button>
+      <button class="nav-item" data-tab="graph"><span class="nav-glyph">KG</span><span>关系图谱</span></button>
+      <button class="nav-item" data-tab="sessions"><span class="nav-glyph">SS</span><span>会话记录</span></button>
+      <div class="nav-label">运维</div>
+      <button class="nav-item" data-tab="console"><span class="nav-glyph">CL</span><span>控制台</span></button>
+      <button class="nav-item" data-tab="audit"><span class="nav-glyph">AL</span><span>变更审计</span></button>
+      <button class="nav-item" data-tab="config"><span class="nav-glyph">CF</span><span>系统配置</span></button>
+      <button class="nav-item" data-tab="files"><span class="nav-glyph">FL</span><span>Persona 与语料</span></button>
+      <button class="nav-item" data-tab="tasks"><span class="nav-glyph">TK</span><span>任务中心</span></button>
+      <button class="nav-item" data-tab="backups"><span class="nav-glyph">BK</span><span>备份恢复</span></button>
+      <button class="nav-item" data-tab="deploy"><span class="nav-glyph">DP</span><span>部署管理</span></button>
+      <div class="nav-label">调试</div>
+      <button class="nav-item" data-tab="debug"><span class="nav-glyph">RC</span><span>记忆调试台</span></button>
+    </nav>
+  </aside>
+
+  <main class="main">
+
+  <!-- ═══ 概览 ═══ -->
+  <section class="tab active" id="tab-overview">
+    <div class="scroll-area">
+      <div class="danger-banner" id="overviewDanger"></div>
+      <div class="page-head" style="margin-bottom:0;"><div><div class="page-title">概览</div><div class="page-desc">服务、记忆、画像、会话</div></div><button class="btn btn-ghost" onclick="refreshAll()">刷新</button></div>
+      <div class="grid cards-grid" id="overviewCards"></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;" id="overviewBottom"></div>
+      <div class="panel" id="overviewPersonsPanel"><div class="label">已实名用户</div><div id="overviewPersons" style="margin-top:12px"></div></div>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-persons">
+    <div class="page-head"><div><div class="page-title">人物画像</div><div class="page-desc">实名用户</div></div></div>
+    <div class="toolbar">
+      <input class="field" id="newPersonId" placeholder="person_id" />
+      <input class="field" id="newPersonName" placeholder="显示名，例如：创造者（不要填叶鹏祥）" />
+      <button class="btn" onclick="createPerson()">创建用户</button>
+      <button class="btn btn-ghost" onclick="loadPersons()">刷新</button>
+    </div>
+    <div id="personList" class="grid cards-grid"></div>
+  </section>
+
+  <section class="tab" id="tab-self">
+    <div class="page-head"><div><div class="page-title">自我认知</div><div class="page-desc">智能体对自己是谁、如何表达、边界与长期规则的认知</div></div><button class="btn btn-ghost" onclick="loadSelfCognition()">刷新</button></div>
+    <div class="split-layout">
+      <div class="panel">
+        <div class="toolbar" style="justify-content:space-between;margin-bottom:10px;">
+          <div><div class="label">源设定 persona.md</div><div class="sub-text" id="selfPersonaMeta">加载中</div></div>
+          <button class="btn btn-sm" onclick="saveSelfCognition('persona')">保存源设定</button>
+        </div>
+        <textarea class="field editor" id="selfPersonaText" placeholder="机器人身份、价值观、表达规则、边界等" style="min-height:52vh;"></textarea>
+      </div>
+      <div class="panel">
+        <div class="toolbar" style="justify-content:space-between;margin-bottom:10px;">
+          <div><div class="label">实际注入 Profile Card</div><div class="sub-text" id="selfProfileMeta">加载中</div></div>
+          <button class="btn btn-sm" onclick="saveSelfCognition('profile')">保存注入卡片</button>
+        </div>
+        <textarea class="field editor" id="selfProfileText" placeholder="每轮对话优先注入的自我认知摘要" style="min-height:52vh;"></textarea>
+      </div>
+    </div>
+    <div class="panel" style="margin-top:14px;">
+      <div class="toolbar" style="justify-content:space-between;">
+        <div><div class="label">同步保存</div><div class="sub-text">推荐同时维护源设定与注入卡片；如果只改 persona.md，已有 profile_card.md 时对话可能不会立刻采用。</div></div>
+        <button class="btn" onclick="saveSelfCognition('all')">保存全部</button>
+      </div>
+      <div id="selfSaveStatus" class="sub-text"></div>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-memory">
+    <div class="page-head"><div><div class="page-title">记忆管理</div><div class="page-desc">按实名用户排列</div></div><button class="btn btn-ghost" onclick="loadMemoryByPerson()">刷新</button></div>
+    <div id="memoryContent"></div>
+  </section>
+
+  <section class="tab" id="tab-contacts">
+    <div class="page-head"><div><div class="page-title">第三方画像</div><div class="page-desc">朋友、亲人、同事与其他记忆人物</div></div><button class="btn" onclick="openContactEditor()">新增画像</button></div>
+    <div class="toolbar">
+      <select class="select" id="contactOwnerFilter" onchange="loadContacts()"></select>
+      <input class="field" id="contactSearch" placeholder="搜索名字、关系、备注" oninput="debouncedContacts()" />
+      <select class="select" id="contactConfirmedFilter" onchange="loadContacts()">
+        <option value="">全部状态</option><option value="true">已确认</option><option value="false">未确认</option>
+      </select>
+    </div>
+    <div id="contactList" class="grid cards-grid"></div>
+  </section>
+
+  <section class="tab" id="tab-graph">
+    <div class="page-head"><div><div class="page-title">关系图谱</div><div class="page-desc">以机器人为核心，向实名用户与第三方画像发散</div></div><button class="btn btn-ghost" onclick="loadGraph()">刷新图谱</button></div>
+    <div class="graph-layout">
+      <div>
+        <div id="graphCanvas"><div class="empty" style="margin:18px">加载图谱中</div></div>
+        <div class="graph-stats" id="graphStats"></div>
+      </div>
+      <aside class="graph-side">
+        <div class="graph-filter">
+          <div class="label" style="margin-bottom:10px">Filter</div>
+          <div class="filter-grid">
+            <select class="select" id="graphTimeFilter" onchange="renderGraph(state.graph)"><option value="">全部时间</option><option value="30">30 天内</option><option value="90">90 天内</option></select>
+            <select class="select" id="graphEmotionFilter" onchange="renderGraph(state.graph)"><option value="">全部关系</option><option value="close">亲密长期</option><option value="daily">日常联系</option><option value="conflict">负面冲突</option><option value="stranger">一次陌生</option></select>
+            <select class="select" id="graphCategoryFilter" onchange="renderGraph(state.graph)"><option value="">全部人物</option><option value="owner">实名用户</option><option value="contact">第三方画像</option></select>
+            <select class="select" id="graphWeightFilter" onchange="renderGraph(state.graph)"><option value="">全部权重</option><option value="high">高权重</option><option value="active">高频互动</option></select>
+          </div>
+        </div>
+        <div class="graph-detail" id="graphDetail">选择一个节点查看详情。</div>
+      </aside>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-sessions">
+    <div class="page-head"><div><div class="page-title">会话记录</div><div class="page-desc">历史消息</div></div></div>
+    <div class="toolbar">
+      <select class="select" id="sessionStatusFilter" onchange="loadSessions()"><option value="">全部状态</option><option value="active">active</option><option value="closed">closed</option></select>
+      <button class="btn btn-ghost" onclick="loadSessions()">刷新</button>
+    </div>
+    <div id="sessionsContent"></div>
+  </section>
+
+  <!-- ═══ 控制台（融合健康） ═══ -->
+  <section class="tab" id="tab-console">
+    <div class="page-head"><div><div class="page-title">控制台</div><div class="page-desc">实时日志 + 服务健康</div></div></div>
+    <div class="console-wrap" style="max-height:60vh;margin-bottom:14px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel-3);">
+        <span style="font-size:0.72rem;font-weight:600;color:var(--muted);display:flex;align-items:center;gap:6px;"><span style="width:6px;height:6px;border-radius:50%;background:var(--accent);display:inline-block;"></span> 实时日志</span>
+        <div style="display:flex;gap:4px;align-items:center;">
+          <input class="field" style="width:100px;font-size:.68rem;padding:4px 8px;" id="consoleFilter" placeholder="关键词过滤" oninput="applyConsoleFilter()" />
+          <button class="btn btn-ghost btn-sm" onclick="toggleConsolePause()" id="consolePauseBtn">暂停</button>
+          <button class="btn btn-ghost btn-sm" onclick="clearConsole()">清空</button>
+        </div>
+      </div>
+      <div class="console" id="consoleOutput">等待日志</div>
+      <div class="console-status">
+        <span id="logCount">0 条</span>
+        <span id="logStatus">&#9679; 已连接</span>
+      </div>
+    </div>
+    <div>
+      <div class="label" style="margin-bottom:8px;">服务健康 <span class="tag" id="healthStatusBadge">检查中</span></div>
+      <div class="health-grid" id="healthGrid"><div class="loading"><span class="spin"></span> 检查中...</div></div>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-tasks">
+    <div class="page-head"><div><div class="page-title">任务中心</div><div class="page-desc">常用后台任务</div></div></div>
+    <div class="grid cards-grid" id="taskGrid"></div>
+    <div id="taskResult"></div>
+  </section>
+
+  <section class="tab" id="tab-config">
+    <div class="page-head"><div><div class="page-title">系统配置</div><div class="page-desc">模型、记忆、画像、日志与服务参数。hover 查看详细说明。</div></div><button class="btn btn-ghost" onclick="loadConfig()">刷新</button></div>
+    <div class="change-summary" id="configChangeSummary"></div>
+    <div id="configContent"></div>
+  </section>
+
+  <!-- ═══ 语料管理（分类展示） ═══ -->
+  <section class="tab" id="tab-files">
+    <div class="page-head"><div><div class="page-title">Persona 与语料</div><div class="page-desc">按用途分类展示，编辑后触发入库</div></div><button class="btn btn-ghost" onclick="loadFiles()">刷新文件</button></div>
+    <div class="corpus-layout">
+      <div class="corpus-groups" id="corpusGroups"><div class="loading"><span class="spin"></span></div></div>
+      <div class="corpus-files" id="corpusFiles"><div class="empty">选择一个分类</div></div>
+      <div class="panel corpus-editor" id="corpusEditor">
+        <div class="toolbar" style="margin-bottom:6px;">
+          <span class="tag accent" id="fileCurrent">未选择文件</span>
+        </div>
+        <textarea class="field editor" id="fileEditor" placeholder="选择左侧文件进行编辑" style="min-height:300px;"></textarea>
+        <div class="actions" style="margin-top:6px;">
+          <button class="btn btn-sm" onclick="saveCurrentFile()">保存</button>
+          <button class="btn btn-ghost btn-sm" onclick="runTask('compress-profile')">生成 Profile Card</button>
+          <button class="btn btn-ghost btn-sm" onclick="runTask('ingest')">同步入库</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-backups">
+    <div class="page-head"><div><div class="page-title">备份恢复</div><div class="page-desc">数据库与 persona 安全快照</div></div><button class="btn btn-ghost" onclick="loadBackups()">刷新</button></div>
+    <div class="toolbar">
+      <button class="btn" onclick="createBackup('all')">备份全部</button>
+      <button class="btn btn-ghost" onclick="createBackup('database')">仅数据库</button>
+      <button class="btn btn-ghost" onclick="createBackup('persona')">仅 Persona</button>
+    </div>
+    <div id="backupContent"></div>
+  </section>
+
+  <section class="tab" id="tab-deploy">
+    <div class="page-head"><div><div class="page-title">部署管理</div><div class="page-desc">代码版本、更新与重启请求</div></div><button class="btn btn-ghost" onclick="loadDeploy()">刷新</button></div>
+    <div id="deployContent"></div>
+  </section>
+
+  <!-- ═══ 变更审计 ═══ -->
+  <section class="tab" id="tab-audit">
+    <div class="page-head"><div><div class="page-title">变更审计</div><div class="page-desc">后台操作时间线 —— 配置修改、人格保存、记忆编辑、任务执行、服务启停等</div></div>
+      <div class="toolbar" style="margin:0">
+        <select class="select" id="auditKindFilter" onchange="loadAuditLog()"><option value="">全部类型</option><option value="config">配置</option><option value="persona">人格</option><option value="memory">记忆</option><option value="task">任务</option><option value="service">服务</option><option value="backup">备份</option><option value="deploy">部署</option></select>
+        <select class="select" id="auditDaysFilter" onchange="loadAuditLog()"><option value="1">今天</option><option value="3">3 天</option><option value="7" selected>7 天</option><option value="30">30 天</option></select>
+        <button class="btn btn-ghost btn-sm" onclick="loadAuditLog()">刷新</button>
+      </div>
+    </div>
+    <div id="auditContent"><div class="loading"><span class="spin"></span> 加载审计日志</div></div>
+  </section>
+
+  <section class="tab" id="tab-debug">
+    <div class="page-head"><div><div class="page-title">记忆调试台</div><div class="page-desc">模拟召回，排查为什么记错或没想起来</div></div></div>
+    <div class="panel">
+      <div class="toolbar">
+        <select class="select" id="debugPerson"></select>
+        <input class="field" id="debugQuery" placeholder="输入一句测试问题，例如：唐凯是谁" style="flex:1" />
+        <button class="btn" onclick="runRecallDebug()">测试召回</button>
+      </div>
+      <div id="debugResult" class="empty">等待测试</div>
+    </div>
+  </section>
+</main>
+</div>
+
+<div class="modal-overlay" id="profileModal"><div class="modal">
+  <h3>编辑画像 · <span id="profileName"></span></h3>
+  <div class="form-grid">
+    <div class="form-group"><label>显示名</label><input class="field" id="pfDisplayName" /></div>
+    <div class="form-group"><label>关系</label><input class="field" id="pfRelationship" /></div>
+    <div class="form-group full"><label>别名，逗号分隔</label><input class="field" id="pfAliases" /></div>
+    <div class="form-group full"><label>性格标签，逗号分隔</label><textarea class="field" id="pfPersonality"></textarea></div>
+    <div class="form-group full"><label>重要经历，逗号分隔</label><textarea class="field" id="pfExperiences"></textarea></div>
+    <div class="form-group full"><label>情绪习惯，逗号分隔</label><textarea class="field" id="pfEmotionalHabit"></textarea></div>
+  </div>
+  <div class="modal-actions"><button class="btn btn-ghost" onclick="closeModal('profileModal')">取消</button><button class="btn" onclick="saveProfile()">保存</button></div>
+</div></div>
+
+<div class="modal-overlay" id="coreModal"><div class="modal">
+  <h3>核心记忆 · <span id="corePersonName"></span></h3>
+  <div id="coreList"></div>
+  <div class="toolbar" style="margin-top:14px">
+    <select class="select" id="coreNewCat"><option value="identity">身份与关系</option><option value="taboo">禁忌与雷区</option><option value="key_people">核心亲人</option><option value="milestone">人生节点</option><option value="preference">偏好与习惯</option></select>
+    <input class="field" id="coreNewContent" placeholder="新增核心记忆" style="flex:1" />
+    <button class="btn" onclick="createCoreItem()">添加</button>
+  </div>
+  <div class="modal-actions"><button class="btn btn-ghost" onclick="closeModal('coreModal')">关闭</button></div>
+</div></div>
+
+<div class="modal-overlay" id="coreEditModal"><div class="modal" style="width:min(580px,96vw)">
+  <h3>修改核心记忆</h3>
+  <div class="form-grid">
+    <div class="form-group"><label>分类</label><select class="select" id="coreEditCat"></select></div>
+    <div class="form-group full"><label>内容</label><textarea class="field" id="coreEditContent" style="min-height:120px;"></textarea></div>
+  </div>
+  <div class="modal-actions"><button class="btn btn-ghost" onclick="closeModal('coreEditModal')">取消</button><button class="btn" onclick="saveCoreEdit()">保存修改</button></div>
+</div></div>
+
+<div class="modal-overlay" id="memoryEditModal"><div class="modal" style="width:min(640px,96vw)">
+  <h3 id="memoryEditTitle">编辑记忆</h3>
+  <div class="form-grid">
+    <div class="form-group">
+      <label>类型</label>
+      <select class="select" id="memoryEditKind"></select>
+    </div>
+    <div class="form-group" id="memoryEditWeightGroup">
+      <label>权重</label>
+      <select class="select" id="memoryEditWeight"><option value="1">1</option><option value="2">2</option><option value="3" selected>3</option><option value="4">4</option><option value="5">5</option></select>
+    </div>
+    <div class="form-group full">
+      <label>内容</label>
+      <textarea class="field" id="memoryEditContent" style="min-height:150px;"></textarea>
+    </div>
+  </div>
+  <div class="modal-actions"><button class="btn btn-ghost" onclick="closeModal('memoryEditModal')">取消</button><button class="btn" onclick="saveMemoryEdit()">保存</button></div>
+</div></div>
+
+<div class="modal-overlay" id="contactModal"><div class="modal">
+  <h3 id="contactModalTitle">第三方画像</h3>
+  <div class="form-grid">
+    <div class="form-group"><label>关联对象</label><select class="select" id="ctOwner"></select></div>
+    <div class="form-group"><label>显示名</label><input class="field" id="ctDisplayName" /></div>
+    <div class="form-group"><label>关系</label><input class="field" id="ctRelationship" placeholder="朋友/母亲/同事" /></div>
+    <div class="form-group"><label>状态</label><select class="select" id="ctConfirmed"><option value="true">已确认</option><option value="false">未确认</option></select></div>
+    <div class="form-group full"><label>别名，逗号分隔</label><input class="field" id="ctAliases" /></div>
+    <div class="form-group full"><label>性格标签，逗号分隔</label><textarea class="field" id="ctPersonality"></textarea></div>
+    <div class="form-group full"><label>重要经历，逗号分隔</label><textarea class="field" id="ctExperiences"></textarea></div>
+    <div class="form-group full"><label>备注，逗号分隔</label><textarea class="field" id="ctNotes"></textarea></div>
+  </div>
+  <div class="modal-actions"><button class="btn btn-ghost" onclick="closeModal('contactModal')">取消</button><button class="btn" onclick="saveContact()">保存</button></div>
+</div></div>
+
+<!-- ═══ 人物详情页 Modal ═══ -->
+<div class="modal-overlay" id="personDetailModal"><div class="modal" style="width:min(960px,96vw);max-height:92vh;overflow:auto;">
+  <h3 style="display:flex;justify-content:space-between;align-items:center;">
+    <span id="pdName"></span>
+    <div><span class="tag accent" id="pdPersonId" style="font-size:.7rem;"></span></div>
+  </h3>
+  <div class="toolbar" style="margin-bottom:12px;gap:4px;">
+    <button class="btn btn-ghost btn-sm" onclick="showPdSection('overview')" id="pdTabOverview" style="background:var(--accent);color:#082018;">概览</button>
+    <button class="btn btn-ghost btn-sm" onclick="showPdSection('core')" id="pdTabCore">核心记忆</button>
+    <button class="btn btn-ghost btn-sm" onclick="showPdSection('recent')" id="pdTabRecent">近期记忆</button>
+    <button class="btn btn-ghost btn-sm" onclick="showPdSection('longTerm')" id="pdTabLongTerm">长期记忆</button>
+    <button class="btn btn-ghost btn-sm" onclick="showPdSection('contact')" id="pdTabContact">第三方画像</button>
+    <button class="btn btn-ghost btn-sm" onclick="showPdSection('session')" id="pdTabSession">会话统计</button>
+    <button class="btn btn-ghost btn-sm" onclick="showPdSection('audit')" id="pdTabAudit">最近变更</button>
+    <button class="btn btn-ghost btn-sm" onclick="showPdSection('relations')" id="pdTabRelations">关系</button>
+  </div>
+  <div id="pdOverview" class="pd-section">
+    <div class="ops-grid" id="pdSummaryCards"></div>
+    <div class="panel" style="margin-top:12px;">
+      <div class="label">人物画像</div>
+      <div id="pdProfileContent" class="sub-text" style="margin-top:8px;">加载中</div>
+      <button class="btn btn-sm" onclick="openPdProfileEditor()" style="margin-top:8px;">编辑画像</button>
+    </div>
+  </div>
+  <div id="pdCore" class="pd-section" style="display:none;"><div class="panel"><div class="label">核心记忆</div><div id="pdCoreContent"></div></div></div>
+  <div id="pdRecent" class="pd-section" style="display:none;"><div class="panel"><div class="label">近期记忆</div><div id="pdRecentContent"></div></div></div>
+  <div id="pdLongTerm" class="pd-section" style="display:none;"><div class="panel"><div class="label">长期记忆</div><div id="pdLongTermContent"></div></div></div>
+  <div id="pdContact" class="pd-section" style="display:none;"><div class="panel"><div class="label">第三方画像</div><div id="pdContactContent"></div></div></div>
+  <div id="pdSession" class="pd-section" style="display:none;"><div class="panel"><div class="label">会话统计</div><div id="pdSessionContent"></div></div></div>
+  <div id="pdAudit" class="pd-section" style="display:none;"><div class="panel"><div class="label">最近变更</div><div id="pdAuditContent"></div></div></div>
+  <div id="pdRelations" class="pd-section" style="display:none;"><div class="panel"><div class="label">关系网络</div><div id="pdRelationsContent"></div></div></div>
+  <div class="modal-actions"><button class="btn btn-ghost" onclick="closeModal('personDetailModal')">关闭</button></div>
+</div></div>
+
+<div class="modal-overlay" id="sessionModal"><div class="modal" style="width:min(820px,96vw)">
+  <h3>会话详情 · <span id="sessionModalId"></span></h3>
+  <div id="sessionMessages"></div>
+  <div class="modal-actions"><button class="btn btn-ghost" onclick="closeModal('sessionModal')">关闭</button></div>
+</div></div>
+
+<div class="modal-overlay" id="confirmModal"><div class="modal" style="width:min(430px,96vw)">
+  <h3 id="confirmTitle">确认</h3>
+  <div id="confirmText" style="color:var(--text-2);line-height:1.6"></div>
+  <div class="modal-actions"><button class="btn btn-ghost" onclick="closeModal('confirmModal')">取消</button><button class="btn btn-danger" id="confirmOkBtn">确认</button></div>
+</div></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const BASE = window.location.origin;
+const ROBOT_OWNER_ID = "robot:sparkbot";
+const ROBOT_OWNER_LABEL = "智能体本人 · 叶鹏祥";
+let token = localStorage.getItem("sparkbot-admin-token") || "dev-token";
+let authBanner = document.getElementById("authBanner");
+const state = { persons: [], contacts: [], sessions: [], consoleLines: [], consolePaused: false, consoleFilter: "", memoryPersonId: "", editingPersonId: "", editingContactId: "", editingCoreId: null, editingMemory: null, coreItems: [], memoryGroups: [], graph: null, graphObjects: null, config: null, files: [], currentFile: "", tasks: [], corpusGroups: [], corpusActiveGroup: null, corpusActiveFile: null, selfCognition: null };
+function apiHeaders(){ return {"Content-Type":"application/json","X-API-Token":token}; }
+async function api(method,path,body,retried=false){
+  const opts={method,headers:apiHeaders()};
+  if(body)opts.body=JSON.stringify(body);
+  const r=await fetch(BASE+path,opts);
+  if(r.status===401 && !retried && token!=="dev-token"){
+    localStorage.removeItem("sparkbot-admin-token");
+    token="dev-token";
+    return api(method,path,body,true);
+  }
+  if(r.status===401){
+    authBanner.textContent="认证失败：API Token 与服务器不一致。请检查 .env 中的 API_TOKEN。";
+    authBanner.classList.add("show");
+    return null;
+  }
+  authBanner.classList.remove("show");
+  if(!r.ok){let d=await r.text();try{d=JSON.parse(d).detail||d}catch{} throw new Error(d||`HTTP ${r.status}`)}
+  return r.json();
+}
+function esc(s){return String(s??"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}
+function saveToken(){const v=($("tokenInput")?.value||"").trim();if(!v)return;localStorage.setItem("sparkbot-admin-token",v);token=v;authBanner.classList.remove("show");loadOverview();}
+function listText(v){ return String(v||"").split(",").map(x=>x.trim()).filter(Boolean); }
+function openModal(id){$(id).classList.add("active");}
+function closeModal(id){$(id).classList.remove("active");}
+document.querySelectorAll(".modal-overlay").forEach(m=>m.addEventListener("click",e=>{if(e.target===m)m.classList.remove("active")}));
+
+document.querySelectorAll(".nav-item").forEach(el=>el.addEventListener("click",()=>goTab(el.dataset.tab)));
+function goTab(tab){
+  document.querySelectorAll(".nav-item").forEach(n=>n.classList.toggle("active",n.dataset.tab===tab));
+  document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));
+  $(`tab-${tab}`).classList.add("active");
+  if(tab==="overview")loadOverview();
+  if(tab==="self")loadSelfCognition();
+  if(tab==="persons")loadPersons();
+  if(tab==="memory")loadMemoryByPerson();
+  if(tab==="contacts")loadContacts();
+  if(tab==="graph")loadGraph();
+  if(tab==="sessions")loadSessions();
+  if(tab==="config")loadConfig();
+  if(tab==="files")loadFiles();
+  if(tab==="console"){startConsole();loadHealthIntoConsole();}
+  if(tab==="tasks")renderTasks();
+  if(tab==="backups")loadBackups();
+  if(tab==="deploy")loadDeploy();
+  if(tab==="audit")loadAuditLog();
+  if(tab==="debug"){fillDebugPersons(); if(!state.persons.length)loadPersons().then(fillDebugPersons);}
+}
+function refreshAll(){ loadOverview(); loadPersons().then(()=>{ fillOwnerSelects(); loadContacts(); }); loadSessions(); }
+
+async function loadOverview(){
+  try{
+    const data=await api("GET","/v1/admin/dashboard");
+    if(!data||data===null){$("overviewCards").innerHTML='<div class="card"><div class="label">错误</div><div class="value err">认证失败</div></div>';return;}
+    const srv=data.server||{}, llm=data.llm||{}, emb=data.embed||{}, db=data.database||{}, mem=data.memory||{};
+    // Risks
+    const dangers=$("overviewDanger");
+    const riskList=data.risks||[];
+    const errorRisks=riskList.filter(r=>r.level==="error");
+    const warningRisks=riskList.filter(r=>r.level==="warning");
+    let dangerHTML=[...errorRisks,...warningRisks].slice(0,5).map(r=>{
+      const icon=r.level==="error"?"🔴":"🟡";
+      const action=r.action?` <a href="${esc(r.action.href)}" style="color:var(--accent);text-decoration:underline;cursor:pointer;" onclick="goTab('${r.action.href.slice(1)}')">${esc(r.action.label)}</a>`:"";
+      return `<div style="padding:3px 0;font-size:.72rem">${icon} ${esc(r.title)}${action}</div>`;
+    }).join("");
+    dangers.innerHTML=dangerHTML||"<span style='color:var(--accent)'>✓ 无风险项</span>";
+    dangers.classList.toggle("show",dangerHTML.length>0);
+
+    // Quick stat cards
+    const cards=[
+      ["服务状态","运行中",`PID ${srv.pid||""} · 运行 ${Math.floor((data.uptime_sec||0)/60)} 分钟`,"console","ok"],
+      ["LLM",llm.configured?"已配置":"未配置",llm.model||"","config",llm.configured?"ok":"err"],
+      ["Embedding",emb.configured?"已配置":"fallback",emb.model||"","config",emb.configured?"ok":"warn"],
+      ["核心记忆",mem.core_memories??0,"Core 固定注入","memory",""],
+      ["情景摘要",mem.episodes_active??0,`总计 ${mem.episodes_total??0}`,"memory",""],
+      ["长期记忆",data.memory?.long_term_memory??0,"LongTerm 记忆块","memory",""],
+      ["人物画像",data.persons?.count??0,"实名用户","persons",""],
+      ["会话",data.sessions?.active??0,`已关闭 ${data.sessions?.closed??0}`,"sessions",""],
+    ];
+    $("overviewCards").innerHTML=cards.map(c=>`<div class="card clickable" onclick="goTab('${c[3]}')"><div><div class="label">${c[0]}</div><div class="value ${c[4]}">${c[1]}</div></div><div class="sub-text">${esc(c[2])}</div></div>`).join("");
+
+    // Recent tasks + suggested actions
+    const recentTasks=(data.recent_tasks||[]).slice(0,4);
+    const suggestedActions=(data.suggested_actions||[]).slice(0,6);
+    $("overviewBottom").innerHTML=[
+      '<div class="panel" style="margin:0;"><div class="label">最近任务</div>'+
+      (recentTasks.length?'<div class="mono" style="margin-top:8px">'+recentTasks.map(t=>'<div style="padding:4px 0;border-bottom:1px solid var(--line);font-size:.72rem">'+esc(t.title||t.name||"")+' <span class="tag '+(t.status==="success"?"accent":"")+'">'+esc(t.status||"-")+'</span> <span style="color:var(--muted)">'+esc((t.started_at||"").slice(5,16))+'</span></div>').join("")+'</div>':'<div class="empty" style="padding:10px">暂无任务</div>')+'</div>',
+      '<div class="panel" style="margin:0;"><div class="label">推荐操作'+(suggestedActions.length?"":"")+'</div>'+
+      (suggestedActions.length?'<div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px;">'+suggestedActions.map(a=>`<button class="btn btn-ghost btn-sm" onclick="goTab('${esc(a.href.slice(1))}')">${esc(a.label)}</button>`).join("")+'</div>':'<div class="sub-text" style="margin-top:8px">当前系统运行正常，无需操作。</div>')+
+      '<div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:4px;">'+
+        ['<button class="btn btn-ghost btn-sm" onclick="goTab(\'self\')">人格工作台</button>',
+         '<button class="btn btn-ghost btn-sm" onclick="goTab(\'console\')">控制台</button>',
+         '<button class="btn btn-ghost btn-sm" onclick="goTab(\'tasks\')">任务中心</button>',
+         '<button class="btn btn-ghost btn-sm" onclick="goTab(\'config\')">系统配置</button>',
+         '<button class="btn btn-ghost btn-sm" onclick="goTab(\'audit\')">变更审计</button>',
+         data.needs_restart?'<button class="btn btn-danger btn-sm" onclick="confirmDelete(\'重启服务\',\'检测到配置变更需重启生效，确定重启？\',async()=>{const d=await api(\'POST\',\'/v1/admin/service/restart\');alert(d.message||\'已触发重启\');})">需要重启</button>':''
+        ].join("")+
+      '</div></div>'
+    ].join("");
+
+    // Users compact
+    const persons=data.persons||{};
+    const list=(data.persons?.list||[]).slice(0,5);
+    const pidList=data.persons?.list||[];
+    $("overviewPersons").innerHTML=list.length?`<div class="ov-table-wrap"><table><thead><tr><th>person_id</th><th>显示名</th><th></th></tr></thead><tbody>${list.map(p=>`<tr><td class="mono">${esc(p.person_id)}</td><td>${esc(p.display_name)}</td><td><button class="btn btn-ghost btn-sm" onclick="openPersonDetail('${esc(p.person_id)}')">详情</button><button class="btn btn-ghost btn-sm" onclick="goTab('memory')">记忆</button></td></tr>`).join("")}</tbody></table></div><div style="margin-top:6px;color:var(--muted);font-size:.72rem">共 ${persons.count||0} 名实名用户</div>`:'<div class="empty" style="padding:10px">暂无实名用户</div>';
+  }catch(e){$("overviewCards").innerHTML=`<div class="card"><div class="label">错误</div><div class="value err">${esc(e.message)}</div></div>`;}
+}
+
+async function loadPersons(){ try{const d=await api("GET","/v1/admin/persons"); state.persons=d.persons||[];}catch{state.persons=[];} renderPersons(); fillOwnerSelects(); return state.persons; }
+function renderPersons(){
+  $("personList").innerHTML=state.persons.length?state.persons.map(p=>`<div class="person-card"><div class="name">${esc(p.display_name||p.person_id)}</div><div class="pid">${esc(p.person_id)}</div><div class="actions"><button class="btn btn-sm" onclick="openPersonDetail('${esc(p.person_id)}')">详情</button><button class="btn btn-ghost btn-sm" onclick="openCoreEditor('${esc(p.person_id)}','${esc(p.display_name||p.person_id)}')">核心记忆</button><button class="btn btn-ghost btn-sm" onclick="openProfileEditor('${esc(p.person_id)}','${esc(p.display_name||p.person_id)}')">画像</button><button class="btn btn-ghost btn-sm" onclick="goTab('contacts');$('contactOwnerFilter').value='${esc(p.person_id)}';loadContacts();">第三方</button><button class="btn btn-danger btn-sm" onclick="confirmDelete('删除用户','确定删除 ${esc(p.display_name||p.person_id)} 及其全部数据？',async()=>{await api('DELETE','/v1/admin/persons/${esc(p.person_id)}');refreshAll();})">删除</button></div></div>`).join(""):'<div class="empty">暂无可管理用户</div>';
+}
+async function createPerson(){const pid=$("newPersonId").value.trim(),name=$("newPersonName").value.trim();if(!pid||!name)return alert("请填写 person_id 和显示名");if(name==="叶鹏祥")return alert("叶鹏祥是智能体自己的名字。创造者调试用户请使用显示名：创造者");try{await api("POST","/v1/admin/persons",{person_id:pid,display_name:name});$("newPersonId").value="";$("newPersonName").value="";refreshAll();}catch(e){alert(e.message);}}
+
+let editingPersonId="";
+async function openProfileEditor(pid,name){editingPersonId=pid;$("profileName").textContent=name;try{const p=await api("GET",`/v1/admin/persons/${pid}/profile`);$("pfDisplayName").value=p.display_name||"";$("pfRelationship").value=p.relationship||"";$("pfAliases").value=(p.aliases||[]).join(", ");$("pfPersonality").value=(p.personality||[]).join(", ");$("pfExperiences").value=(p.experiences||[]).join(", ");$("pfEmotionalHabit").value=(p.emotional_habit||[]).join(", ");openModal("profileModal");}catch(e){alert(e.message);}}
+async function saveProfile(){const body={display_name:$("pfDisplayName").value.trim(),relationship:$("pfRelationship").value.trim(),aliases:listText($("pfAliases").value),personality:listText($("pfPersonality").value),experiences:listText($("pfExperiences").value),emotional_habit:listText($("pfEmotionalHabit").value)};try{await api("PUT",`/v1/admin/persons/${editingPersonId}/profile`,body);closeModal("profileModal");refreshAll();}catch(e){alert(e.message);}}
+
+function fmtFileMeta(f){return f&&f.path?`${esc(f.path)} · ${Math.round((f.size||0)/1024)} KB`:"未创建";}
+async function loadSelfCognition(){
+  try{
+    const d=await api("GET","/v1/admin/agent/self");
+    state.selfCognition=d;
+    $("selfPersonaText").value=d.persona?.content||"";
+    $("selfProfileText").value=d.profile_card?.content||"";
+    $("selfPersonaMeta").innerHTML=fmtFileMeta(d.persona);
+    $("selfProfileMeta").innerHTML=fmtFileMeta(d.profile_card);
+    $("selfSaveStatus").textContent=d.hint||"";
+  }catch(e){
+    $("selfSaveStatus").textContent=e.message;
+  }
+}
+async function saveSelfCognition(scope){
+  const body={};
+  if(scope==="persona"||scope==="all")body.persona_text=$("selfPersonaText").value;
+  if(scope==="profile"||scope==="all")body.profile_card_text=$("selfProfileText").value;
+  try{
+    const d=await api("PUT","/v1/admin/agent/self",body);
+    state.selfCognition=d;
+    $("selfSaveStatus").textContent="已保存，后续对话会重新读取最新自我认知。";
+    $("selfPersonaMeta").innerHTML=fmtFileMeta(d.persona);
+    $("selfProfileMeta").innerHTML=fmtFileMeta(d.profile_card);
+  }catch(e){$("selfSaveStatus").textContent=e.message;alert(e.message);}
+}
+
+async function openCoreEditor(pid,name){state.memoryPersonId=pid;$("corePersonName").textContent=name;openModal("coreModal");await loadCoreList();}
+function coreCategoryOptions(labels,selected){return Object.entries(labels||{}).map(([k,v])=>`<option value="${esc(k)}"${k===selected?' selected':''}>${esc(v)}</option>`).join("");}
+async function loadCoreList(){try{const d=await api("GET",`/v1/admin/persons/${state.memoryPersonId}/core-memories`);const labels=d.categories||{},items=d.items||[];state.coreItems=items;state.coreLabels=labels;$("coreList").innerHTML=items.length?items.map(i=>`<div class="mini-item"><span class="tag accent">${esc(labels[i.category]||i.category)}</span><span>${esc(i.content)}</span><span style="float:right;display:inline-flex;gap:6px;"><button class="btn btn-ghost btn-sm" onclick="openCoreEdit('${esc(i.id)}')">编辑</button><button class="btn btn-danger btn-sm" onclick="deleteCoreItem('${esc(i.id)}')">删除</button></span></div>`).join(""):'<div class="empty">暂无核心记忆</div>';}catch(e){$("coreList").innerHTML=`<div class="empty">${esc(e.message)}</div>`;}}
+async function createCoreItem(){const content=$("coreNewContent").value.trim();if(!content)return;try{await api("POST",`/v1/admin/persons/${state.memoryPersonId}/core-memories`,{category:$("coreNewCat").value,content});$("coreNewContent").value="";await loadCoreList();await loadMemoryByPerson();}catch(e){alert(e.message);}}
+function openCoreEdit(id){const item=(state.coreItems||[]).find(x=>x.id===id);if(!item)return;state.editingCoreId=id;$("coreEditCat").innerHTML=coreCategoryOptions(state.coreLabels,item.category);$("coreEditContent").value=item.content||"";openModal("coreEditModal");}
+async function saveCoreEdit(){const id=state.editingCoreId;if(!id)return;const body={category:$("coreEditCat").value,content:$("coreEditContent").value.trim()};try{await api("PATCH",`/v1/admin/persons/${state.memoryPersonId}/core-memories/${id}`,body);closeModal("coreEditModal");await loadCoreList();await loadMemoryByPerson();loadGraph();}catch(e){alert(e.message);}}
+async function deleteCoreItem(id){try{await api("DELETE",`/v1/admin/persons/${state.memoryPersonId}/core-memories/${id}`);await loadCoreList();await loadMemoryByPerson();}catch(e){alert(e.message);}}
+
+async function loadMemoryByPerson(){
+  $("memoryContent").innerHTML='<div class="empty">加载中</div>';
+  try{const d=await api("GET","/v1/admin/memory/by-person");const groups=d.groups||[];
+    state.memoryGroups=groups;
+    $("memoryContent").innerHTML=groups.length?groups.map((g,idx)=>{const p=g.person,c=g.counts||{};const pid=esc(p.person_id),name=esc(p.display_name||p.person_id);return `<div class="panel memory-group ${idx===0?'open':''}"><div class="memory-header" onclick="this.parentElement.classList.toggle('open')"><div><div class="name">${name}</div><div class="pid">${pid}</div></div><div><span class="tag accent">核心 ${c.core_memories||0}</span><span class="tag">情景 ${c.episodes||0}</span><span class="tag">长期 ${c.long_term_memory||0}</span><span class="tag">第三方 ${c.contacts||0}</span></div></div><div class="memory-body"><div class="mini-list"><h3>核心记忆 <button class="btn btn-ghost btn-sm" onclick="event.stopPropagation();openCoreEditor('${pid}','${name}')">编辑</button></h3>${miniItems(g.core_memories,'content','category_label')}</div><div class="mini-list"><h3>情景记忆 <button class="btn btn-ghost btn-sm" onclick="event.stopPropagation();openMemoryEditor('recent','${pid}')">添加</button></h3>${editableMemoryItems('recent',p.person_id,g.episodes,'summary','created_at')}</div><div class="mini-list"><h3>长期记忆 <button class="btn btn-ghost btn-sm" onclick="event.stopPropagation();openMemoryEditor('long','${pid}')">添加</button></h3>${editableMemoryItems('long',p.person_id,g.long_term_memory,'text','category')}</div></div></div>`}).join(""):'<div class="empty">暂无实名用户记忆</div>';
+  }catch(e){$("memoryContent").innerHTML=`<div class="empty">${esc(e.message)}</div>`;}
+}
+function miniItems(items,textKey,metaKey){return (items||[]).length?(items||[]).map(i=>`<div class="mini-item">${esc((i[textKey]||"").slice(0,180))}<div class="pid">${esc(i[metaKey]||"")}</div></div>`).join(""):'<div class="mini-item">暂无</div>';}
+function editableMemoryItems(scope,pid,items,textKey,metaKey){
+  return (items||[]).length?(items||[]).map(i=>{
+    const id=esc(i.id||"");
+    const text=esc((i[textKey]||i.content||i.summary||i.text||"").slice(0,180));
+    const meta=esc(i[metaKey]||i.kind||i.category||"");
+    return `<div class="mini-item">${text}<div class="pid">${meta}</div><div class="actions" style="margin-top:8px;"><button class="btn btn-ghost btn-sm" onclick="event.stopPropagation();openMemoryEditor('${scope}','${esc(pid)}','${id}')">编辑</button><button class="btn btn-danger btn-sm" onclick="event.stopPropagation();deleteMemoryItem('${scope}','${esc(pid)}','${id}')">删除</button></div></div>`;
+  }).join(""):'<div class="mini-item">暂无</div>';
+}
+function memoryKindOptions(scope,selected){
+  const opts=scope==="recent"?[["episode","情景摘要"],["emotion","情绪事件"],["milestone","重要节点"]]:[["fact","事实"],["entity","实体"],["wiki","语料"],["relationship","关系"],["correction","纠错"]];
+  return opts.map(([k,v])=>`<option value="${k}"${k===selected?' selected':''}>${v}</option>`).join("");
+}
+function findMemoryItem(scope,pid,id){
+  const group=(state.memoryGroups||[]).find(g=>String(g.person?.person_id||"")===String(pid));
+  const list=scope==="recent"?(group?.episodes||[]):(group?.long_term_memory||[]);
+  return (list||[]).find(x=>String(x.id||"")===String(id||""));
+}
+function openMemoryEditor(scope,pid,id=""){
+  const item=id?findMemoryItem(scope,pid,id):null;
+  state.editingMemory={scope,pid,id};
+  $("memoryEditTitle").textContent=(id?"编辑":"新增")+(scope==="recent"?"情景记忆":"长期记忆");
+  $("memoryEditKind").innerHTML=memoryKindOptions(scope,item?.kind||item?.category||(scope==="recent"?"episode":"fact"));
+  $("memoryEditContent").value=item?.content||item?.summary||item?.text||"";
+  $("memoryEditWeightGroup").style.display=scope==="recent"?"block":"none";
+  $("memoryEditWeight").value=String(item?.emotional_weight||3);
+  openModal("memoryEditModal");
+}
+async function saveMemoryEdit(){
+  const m=state.editingMemory;if(!m)return;
+  const content=$("memoryEditContent").value.trim();if(!content)return alert("请填写记忆内容");
+  const body={kind:$("memoryEditKind").value,content};
+  if(m.scope==="recent"){body.emotional_weight=Number($("memoryEditWeight").value||3);body.recency_weight=body.emotional_weight;}
+  else{body.confidence=1.0;}
+  const base=m.scope==="recent"?`/v1/admin/persons/${m.pid}/recent-memories`:`/v1/admin/persons/${m.pid}/long-term-memories`;
+  try{if(m.id)await api("PATCH",`${base}/${m.id}`,body);else await api("POST",base,body);closeModal("memoryEditModal");await loadMemoryByPerson();loadGraph();}catch(e){alert(e.message);}
+}
+async function deleteMemoryItem(scope,pid,id){
+  const name=scope==="recent"?"情景记忆":"长期记忆";
+  confirmDelete("删除"+name,"确定删除这条"+name+"？",async()=>{
+    const base=scope==="recent"?`/v1/admin/persons/${pid}/recent-memories`:`/v1/admin/persons/${pid}/long-term-memories`;
+    await api("DELETE",`${base}/${id}`);
+    await loadMemoryByPerson();loadGraph();
+  });
+}
+
+function fillOwnerSelects(){
+  const ownerOptions = [`<option value="${ROBOT_OWNER_ID}">${ROBOT_OWNER_LABEL}</option>`].concat(state.persons.map(p=>`<option value="${esc(p.person_id)}">${esc(p.display_name||p.person_id)}</option>`));
+  const opts=['<option value="">全部关联对象</option>'].concat(ownerOptions).join("");
+  if($("contactOwnerFilter"))$("contactOwnerFilter").innerHTML=opts;
+  const optsRequired=ownerOptions.join("");
+  if($("ctOwner"))$("ctOwner").innerHTML=optsRequired;
+}
+let contactTimer=null; function debouncedContacts(){clearTimeout(contactTimer);contactTimer=setTimeout(loadContacts,220);}
+async function loadContacts(){
+  try{const p=new URLSearchParams();const owner=$("contactOwnerFilter").value,q=$("contactSearch").value.trim(),cf=$("contactConfirmedFilter").value;if(owner)p.set("owner_person_id",owner);if(q)p.set("q",q);if(cf)p.set("confirmed",cf);const d=await api("GET",`/v1/admin/contacts?${p}`);state.contacts=d.contacts||[];}catch{state.contacts=[];}
+  renderContacts();
+}
+function renderContacts(){
+  $("contactList").innerHTML=state.contacts.length?state.contacts.map(c=>`<div class="contact-card"><div class="name">${esc(c.display_name)}</div><div class="pid">${esc(c.person_id)}</div><div style="margin-top:10px"><span class="tag accent">${esc(c.relationship||"相关人物")}</span><span class="tag">${esc(c.owner_display_name||c.owner_person_id)}</span><span class="tag">${c.confirmed?"已确认":"未确认"}</span></div><div class="sub-text" style="margin-top:10px">${esc((c.notes||[]).slice(0,2).join("；")||"暂无备注")}</div><div class="actions"><button class="btn btn-sm" onclick="openContactEditor('${esc(c.person_id)}')">编辑</button><button class="btn btn-danger btn-sm" onclick="confirmDelete('删除第三方画像','确定删除 ${esc(c.display_name)}？',async()=>{await api('DELETE','/v1/admin/contacts/${esc(c.person_id)}');loadContacts();loadGraph();})">删除</button></div></div>`).join(""):'<div class="empty">暂无第三方画像</div>';
+}
+async function openContactEditor(pid=""){state.editingContactId=pid;$("contactModalTitle").textContent=pid?"编辑第三方画像":"新增第三方画像";["ctDisplayName","ctRelationship","ctAliases","ctPersonality","ctExperiences","ctNotes"].forEach(id=>$(id).value="");$("ctConfirmed").value="true";if(!state.persons.length)await loadPersons();fillOwnerSelects();if(pid){try{const c=await api("GET",`/v1/admin/contacts/${pid}`);$("ctOwner").value=c.owner_person_id||"";$("ctDisplayName").value=c.display_name||"";$("ctRelationship").value=c.relationship||"";$("ctAliases").value=(c.aliases||[]).join(", ");$("ctPersonality").value=(c.personality||[]).join(", ");$("ctExperiences").value=(c.experiences||[]).join(", ");$("ctNotes").value=(c.notes||[]).join(", ");$("ctConfirmed").value=String(!!c.confirmed);}catch(e){alert(e.message);return;}}openModal("contactModal");}
+async function saveContact(){const body={owner_person_id:$("ctOwner").value,display_name:$("ctDisplayName").value.trim(),relationship:$("ctRelationship").value.trim(),aliases:listText($("ctAliases").value),personality:listText($("ctPersonality").value),experiences:listText($("ctExperiences").value),notes:listText($("ctNotes").value),confirmed:$("ctConfirmed").value==="true"};try{if(state.editingContactId)await api("PATCH",`/v1/admin/contacts/${state.editingContactId}`,body);else await api("POST","/v1/admin/contacts",body);closeModal("contactModal");loadContacts();loadGraph();}catch(e){alert(e.message);}}
+
+async function loadSessions(){try{const s=$("sessionStatusFilter").value;const d=await api("GET",`/v1/admin/sessions?limit=100&status=${encodeURIComponent(s)}`);state.sessions=d.sessions||[];}catch{state.sessions=[];}renderSessions();}
+function renderSessions(){const s=state.sessions;$("sessionsContent").innerHTML=s.length?`<div class="table-wrap"><table><thead><tr><th>ID</th><th>设备</th><th>状态</th><th>对象</th><th>最近活跃</th><th></th></tr></thead><tbody>${s.map(x=>`<tr><td class="mono">${esc((x.id||"").slice(0,14))}</td><td>${esc(x.device_id||"")}</td><td><span class="tag ${x.status==='active'?'accent':''}">${esc(x.status||"")}</span></td><td class="mono">${esc((x.active_person_id||"").slice(0,18))}</td><td>${esc((x.last_active||"").slice(0,16))}</td><td><button class="btn btn-ghost btn-sm" onclick="viewSessionMessages('${esc(x.id)}')">消息</button></td></tr>`).join("")}</tbody></table></div>`:'<div class="empty">暂无会话</div>';}
+async function viewSessionMessages(sid){$("sessionModalId").textContent=sid.slice(0,16);openModal("sessionModal");try{const d=await api("GET",`/v1/admin/sessions/${sid}/messages`);const msgs=d.messages||[];$("sessionMessages").innerHTML=msgs.length?msgs.map(m=>`<div class="mini-item"><span class="tag">${esc(m.role)}</span>${esc(m.content)}</div>`).join(""):'<div class="empty">无消息</div>';}catch(e){$("sessionMessages").innerHTML=`<div class="empty">${esc(e.message)}</div>`;}}
+
+let consoleReader=null, consoleAbort=null;
+function startConsole(){if(consoleReader)return;connectConsole();}
+async function connectConsole(){consoleAbort=new AbortController();try{const r=await fetch(`${BASE}/v1/admin/logs/stream?ts=${Date.now()}`,{headers:apiHeaders(),signal:consoleAbort.signal});if(!r.ok||!r.body)return;consoleReader=r.body.getReader();const decoder=new TextDecoder();let buf="";while(true){const {done,value}=await consoleReader.read();if(done)break;buf+=decoder.decode(value,{stream:true});const lines=buf.split("\n");buf=lines.pop()||"";for(const line of lines){if(line.startsWith("data: "))state.consoleLines.push(line.slice(6));}if(!state.consolePaused)rerenderConsole();}}catch(e){if(e.name==="AbortError")return;}finally{consoleReader=null;setTimeout(()=>{if(document.getElementById("tab-console").classList.contains("active"))connectConsole();},1800);}}
+function toggleConsolePause(){state.consolePaused=!state.consolePaused;$("consolePauseBtn").textContent=state.consolePaused?"继续":"暂停";if(!state.consolePaused)rerenderConsole();}
+function clearConsole(){state.consoleLines=[];rerenderConsole();}
+function applyConsoleFilter(){state.consoleFilter=$("consoleFilter").value.trim().toLowerCase();rerenderConsole();}
+function rerenderConsole(){const kw=state.consoleFilter;const lines=kw?state.consoleLines.filter(l=>l.toLowerCase().includes(kw)):state.consoleLines;const cls=l=>l.includes("[警告]")?"warn":(l.includes("[错误]")||l.includes("ERROR"))?"err":(l.includes("[启动]")||l.includes("任务"))?"highlight":"";$("consoleOutput").innerHTML=lines.length?lines.slice(-500).map(l=>`<div class="${cls(l)}">${esc(l)}</div>`).join(""):"等待日志";$("consoleOutput").scrollTop=$("consoleOutput").scrollHeight;}
+
+// ── 健康检查（控制台下方） ──
+async function loadHealthIntoConsole(){
+  const grid=$("healthGrid"); const badge=$("healthStatusBadge");
+  grid.innerHTML='<div class="loading"><span class="spin"></span> 检查中...</div>';
+  try{
+    const d=await api("GET","/v1/admin/health/deep");
+    if(!d){grid.innerHTML='<div class="empty">检查失败</div>';return;}
+    const ok=!d.llm||d.llm.ok;
+    badge.textContent=ok?"正常":"异常";
+    badge.style.background=ok?"rgba(119,215,178,.12)":"rgba(255,126,120,.12)";
+    badge.style.color=ok?"var(--accent)":"var(--err)";
+    const cards=[
+      ["DeepSeek",d.llm.ok?"可用":(d.llm.configured===false?"未配置":"异常"),d.llm.model,d.llm.ok?"ok":"err"],
+      ["Embedding",d.embed.ok?"可用":(d.embed.configured===false?"fallback":"异常"),d.embed.provider||d.embed.model,d.embed.ok?"ok":"warn"],
+      ["SQLite",d.database.ok?"正常":"异常","",d.database.ok?"ok":"err"],
+      ["进程 PID",d.server.pid,"",""],
+      ["运行时间",d.server.uptime_sec+" s","",""],
+      ["长期记忆",d.memory.long_term_memory??0,"LongTerm chunks",""],
+    ];
+    grid.innerHTML=cards.map(c=>`<div class="hcard"><div class="hl">${c[0]}</div><div class="hv ${c[3]||""}">${c[1]}</div>${c[2]?'<div style="font-size:0.6rem;color:var(--muted);margin-top:2px;">'+c[2]+'</div>':''}</div>`).join("");
+  }catch(e){grid.innerHTML=`<div class="empty">${esc(e.message)}</div>`;}
+}
+
+async function renderTasks(){try{const d=await api("GET","/v1/admin/tasks");state.tasks=d.tasks||[];const available=d.available||[];$("taskGrid").innerHTML=available.map(t=>`<div class="task-card" onclick="runTask('${t.name}')" id="task-${t.name}"><div class="name">${esc(t.title)}</div><div class="sub-text" style="margin-top:8px">${esc(t.name)}</div><div class="pid" id="task-status-${t.name}">点击执行</div></div>`).join("");renderTaskHistory();}catch(e){$("taskGrid").innerHTML=`<div class="empty">${esc(e.message)}</div>`;}}
+function renderTaskHistory(){if(!$("taskResult"))return;$("taskResult").innerHTML=state.tasks.length?`<div class="panel"><div class="label">执行记录</div><div class="table-wrap" style="margin-top:12px"><table><thead><tr><th>任务</th><th>状态</th><th>时间</th><th>输出</th></tr></thead><tbody>${state.tasks.map(t=>`<tr onclick="viewTask('${esc(t.id)}')"><td>${esc(t.title||t.name)}</td><td><span class="tag ${t.status==='success'?'accent':''}">${esc(t.status)}</span></td><td>${esc((t.started_at||"").slice(5))}</td><td class="mono">${esc((t.error||((t.log||[])[0]||"")).slice(0,80))}</td></tr>`).join("")}</tbody></table></div></div>`:"";}
+async function runTask(name){const el=$("task-status-"+name);if(el)el.textContent="已提交";try{const d=await api("POST","/v1/admin/tasks/"+name);if(el)el.textContent=d.status||"running";$("taskResult").innerHTML=`<div class="panel"><div class="label">任务已启动</div><pre class="mono">${esc(JSON.stringify(d,null,2))}</pre></div>`;setTimeout(renderTasks,900);}catch(e){if(el)el.textContent=e.message;else alert(e.message);}}
+async function viewTask(id){try{const t=await api("GET","/v1/admin/tasks/"+id);$("taskResult").innerHTML=`<div class="panel"><div class="label">${esc(t.title||t.name)} · ${esc(t.status)}</div><pre class="console" style="height:320px;margin-top:12px">${esc(JSON.stringify(t.result||{},null,2))}\n${esc(t.error||"")}\n${esc((t.log||[]).join("\n"))}</pre></div>`;}catch(e){alert(e.message);}}
+
+// ── 配置（带 tooltip） ──
+async function loadConfig(){try{const d=await api("GET","/v1/admin/config");state.config=d;const groups={};(d.fields||[]).forEach(f=>{(groups[f.category]||=[]).push(f);});$("configContent").innerHTML=Object.entries(groups).map(([cat,fields])=>`<div class="panel"><div class="page-head" style="margin-bottom:12px"><div><div class="label">${esc(cat)}</div><div class="sub-text">修改后点击保存，敏感字段留空表示不变。hover 查看配置项说明</div></div><button class="btn btn-sm" onclick="saveConfigCategory('${esc(cat)}')">保存 ${esc(cat)}</button></div><div class="config-grid">${fields.map(configFieldHtml).join("")}</div></div>`).join("");}catch(e){$("configContent").innerHTML=`<div class="empty">${esc(e.message)}</div>`;}}
+function configFieldHtml(f){
+  const id="cfg-"+f.key;
+  const restart=f.restart_required?'<span class="tag">需重启</span>':'';
+  const infoIcon='<span style="cursor:help;color:var(--muted);font-size:.7rem;">&#9432;</span>';
+  let input;
+  if(f.type==="bool"){const checked=(String(f.value).toLowerCase()==="true"||f.value===true)?"checked":"";input=`<select class="select" id="${id}" data-key="${f.key}" data-cat="${esc(f.category)}"><option value="true" ${checked?'selected':''}>true</option><option value="false" ${!checked?'selected':''}>false</option></select>`;}
+  else{input=`<input class="field" id="${id}" data-key="${f.key}" data-cat="${esc(f.category)}" type="${f.sensitive?'password':'text'}" placeholder="${esc(f.sensitive?(f.masked_value||'留空不变'):'')}" value="${f.sensitive?'':esc(f.value)}" />`;}
+  return `<div class="config-card">\
+<label><span>${esc(f.label)} ${infoIcon}</span>${restart?restart:'<span class="tag accent">热更新</span>'}</label>\
+${input}\
+<div class="pid">${esc(f.key)}${f.sensitive&&f.configured?' · 已配置 '+esc(f.masked_value):''}</div>\
+<div style="margin-top:4px;font-size:.68rem;color:var(--text-2);">${esc(f.description||f.key)}</div>\
+<div class="config-tooltip"><strong>${esc(f.label)}</strong>\
+${f.description?'<div style="margin-top:4px;">'+esc(f.description)+'</div>':''}\
+${f.impact?'<div style="margin-top:4px;color:var(--text-2);"><strong>影响范围：</strong>'+esc(f.impact)+'</div>':''}\
+${f.safe_hint?'<div style="margin-top:2px;color:var(--warn);"><strong>建议：</strong>'+esc(f.safe_hint)+'</div>':''}\
+${f.restart_required?'<div style="margin-top:4px;color:var(--err);">⚠ 修改需重启服务生效</div>':''}\
+</div></div>`;
+}
+async function saveConfigCategory(cat){const values={};document.querySelectorAll(`[data-cat="${CSS.escape(cat)}"]`).forEach(el=>{const key=el.dataset.key,val=el.value;if(el.type==="password"&&!val.trim())return;values[key]=val;});try{const d=await api("PATCH","/v1/admin/config",{values});const summary=$("configChangeSummary");if(d.updated&&d.updated.length){summary.innerHTML='<div class="cs-title">✓ 已保存</div>'+d.updated.map(k=>'<div class="cs-item">'+esc(k)+' 已更新</div>').join('')+((d.restart_required||[]).length?'<div class="cs-item" style="color:var(--err);margin-top:4px;">⚠ 部分修改需重启服务生效</div>':'');summary.classList.add("show");setTimeout(()=>summary.classList.remove("show"),8000);}loadConfig();}catch(e){alert(e.message);}}
+
+// ── 语料分类展示 ──
+async function loadFiles(){
+  try{const d=await api("GET","/v1/admin/files");state.files=d.files||[];buildCorpusGroups();}catch(e){$("corpusGroups").innerHTML=`<div class="empty">${esc(e.message)}</div>`;}
+}
+function buildCorpusGroups(){
+  const groups={};
+  state.files.forEach(f=>{
+    const gk=f.group_key||"other";
+    if(!groups[gk])groups[gk]={group_key:gk,group:f.group||"未分类",description:f.description||"",files:[]};
+    groups[gk].files.push(f);
+  });
+  state.corpusGroups=Object.values(groups).sort((a,b)=>((a.group_key==="other"?99:0)-(b.group_key==="other"?99:0)));
+  // Select first
+  if(state.corpusGroups.length&&!state.corpusActiveGroup)state.corpusActiveGroup=state.corpusGroups[0].group_key;
+  renderCorpus();
+}
+function renderCorpus(){
+  const groups=state.corpusGroups;
+  const active=state.corpusActiveGroup;
+  const gl=$("corpusGroups");
+  if(!groups.length){gl.innerHTML='<div class="empty">暂无文件</div>';return;}
+  gl.innerHTML=groups.map(g=>`<div class="g-item${g.group_key===active?' active':''}" onclick="window._selectCorpusGroup('${g.group_key}')"><span>${esc(g.group)}</span><span class="cnt">${g.files.length}</span></div>`).join("");
+  const g=groups.find(x=>x.group_key===active);
+  const fl=$("corpusFiles");
+  if(!g||!g.files.length){fl.innerHTML='<div class="empty">暂无文件</div>';return;}
+  fl.innerHTML=g.files.map(f=>`<div class="f-item${state.corpusActiveFile===f.path?' active':''}" onclick="window._selectCorpusFile('${esc(f.path)}')"><div>${esc(f.name)}</div><div class="fdesc">${esc(f.description||'')}</div></div>`).join("");
+}
+window._selectCorpusGroup=function(key){state.corpusActiveGroup=key;state.corpusActiveFile=null;renderCorpus();$('corpusEditor').innerHTML='<div class="toolbar" style="margin-bottom:6px;"><span class="tag accent" id="fileCurrent">未选择文件</span></div><textarea class="field editor" id="fileEditor" placeholder="选择左侧文件进行编辑" style="min-height:300px;"></textarea><div class="actions" style="margin-top:6px;"><button class="btn btn-sm" onclick="saveCurrentFile()">保存</button><button class="btn btn-ghost btn-sm" onclick="runTask(\'compress-profile\')">生成 Profile Card</button><button class="btn btn-ghost btn-sm" onclick="runTask(\'ingest\')">同步入库</button></div>';};
+window._selectCorpusFile=async function(path){
+  state.corpusActiveFile=path;
+  renderCorpus();
+  $("fileCurrent").textContent=path;
+  $("fileEditor").value="加载中";
+  try{const d=await api("GET","/v1/admin/files/"+encodeURIComponent(path).replaceAll("%2F","/"));$("fileEditor").value=d.content||"";}catch(e){$("fileEditor").value=e.message;}
+};
+
+async function loadHealth(){
+  try{const d=await api("GET","/v1/admin/health/deep");const cards=[["服务",`PID ${d.server.pid}`,`运行 ${d.server.uptime_sec}s · ${d.server.host}:${d.server.port}`,"ok"],["DeepSeek",d.llm.ok?"可用":"未配置",d.llm.model,d.llm.ok?"ok":"err"],["Embedding",d.embed.ok?"可用":"fallback",`${d.embed.provider} · ${d.embed.model}`,d.embed.ok?"ok":"warn"],["SQLite",d.database.ok?"正常":"异常",d.database.detail,d.database.ok?"ok":"err"],["搜索后端",d.search.backend,d.search.es_url||"",""],["长期记忆",d.memory.long_term_memory??0,"LongTerm chunks",""]];$("healthContent").innerHTML=`<div class="grid cards-grid">${cards.map(c=>`<div class="card"><div><div class="label"><span class="status-dot ${c[3]}"></span>${esc(c[0])}</div><div class="value ${c[3]}">${esc(c[1])}</div></div><div class="sub-text">${esc(c[2])}</div></div>`).join("")}</div><div class="panel"><pre class="mono">${esc(JSON.stringify(d,null,2))}</pre></div>`;}catch(e){$("healthContent").innerHTML=`<div class="empty">${esc(e.message)}</div>`;}}
+
+async function loadBackups(){try{const d=await api("GET","/v1/admin/backups");const rows=d.backups||[];$("backupContent").innerHTML=rows.length?`<div class="table-wrap"><table><thead><tr><th>名称</th><th>类型</th><th>大小</th><th>时间</th><th></th></tr></thead><tbody>${rows.map(b=>`<tr><td class="mono">${esc(b.name)}</td><td>${esc(b.kind)}</td><td>${Math.round((b.size||0)/1024)} KB</td><td>${esc(b.created_at)}</td><td><button class="btn btn-danger btn-sm" onclick="confirmDelete('恢复备份','恢复前会自动创建安全快照，确定恢复 ${esc(b.name)}？',async()=>restoreBackup('${esc(b.id)}'))">恢复</button></td></tr>`).join("")}</tbody></table></div>`:'<div class="empty">暂无备份</div>';}catch(e){$("backupContent").innerHTML=`<div class="empty">${esc(e.message)}</div>`;}}
+async function createBackup(kind){try{await api("POST","/v1/admin/backups",{kind});loadBackups();}catch(e){alert(e.message);}}
+async function restoreBackup(id){try{const d=await api("POST","/v1/admin/backups/"+id+"/restore");alert("已恢复，建议重启服务。\n"+JSON.stringify(d,null,2));loadBackups();}catch(e){alert(e.message);}}
+
+async function loadDeploy(){try{const d=await api("GET","/v1/admin/deploy/status");const rm=d.service.restart_mode||{};$("deployContent").innerHTML=`<div class="ops-grid"><div class="card"><div class="label">分支</div><div class="value">${esc(d.git.branch||"-")}</div><div class="sub-text">${esc(d.git.commit||"")}</div></div><div class="card"><div class="label">进程</div><div class="value">PID ${esc(d.service.pid)}</div><div class="sub-text">${esc(d.service.start_command)}</div></div><div class="card"><div class="label">服务控制</div><div class="value ${rm.can_restart?'ok':'warn'}">${esc(rm.mode||"-")}</div><div class="sub-text">${esc(rm.reason||d.service.unit_path||"")}</div></div></div><div class="panel danger-zone"><div class="toolbar"><button class="btn btn-danger" onclick="confirmDelete('部署更新','将执行 git pull --ff-only，确定继续？',deployUpdate)">拉取更新</button><button class="btn btn-ghost" onclick="confirmDelete('启动服务','将执行固定 systemd 启动命令：systemctl start sparkbot-agent.service。确定继续？',serviceControl.bind(null,'start'))">启动服务</button><button class="btn btn-danger" onclick="confirmDelete('停止服务','会停止后端服务，当前页面可能立即断开。确定继续？',serviceControl.bind(null,'stop'))">停止服务</button><button class="btn btn-danger" onclick="confirmDelete('一键重启服务','会重启后端服务，当前页面可能短暂断开，约 5-15 秒后自动恢复。确定继续？',serviceControl.bind(null,'restart'))">一键重启服务</button></div><div id="restartStatus" class="sub-text" style="margin-bottom:12px;">${esc(rm.can_restart?'生产环境将通过 systemd 执行固定服务控制命令。':'当前环境不会自动杀进程，适合本地开发安全调试。')}</div><pre class="mono">${esc((d.git.dirty||[]).join("\\n")||"工作区干净或无法读取")}</pre></div>`;}catch(e){$("deployContent").innerHTML=`<div class="empty">${esc(e.message)}</div>`;}}
+async function deployUpdate(){try{const d=await api("POST","/v1/admin/deploy/update");alert(JSON.stringify(d,null,2));loadDeploy();}catch(e){alert(e.message);}}
+function setRestartStatus(text,cls="sub-text"){const el=$("restartStatus");if(el){el.className=cls;el.textContent=text;}}
+async function waitServiceRecovery(startedAt){
+  const deadline=Date.now()+30000;
+  while(Date.now()<deadline){
+    await new Promise(r=>setTimeout(r,1800));
+    try{
+      const d=await api("GET","/v1/admin/health/deep");
+      if(!startedAt||!d.server||Number(d.server.started_at||0)>=Number(startedAt||0)){
+        setRestartStatus("服务已恢复，后台连接正常。","sub-text ok");
+        loadDeploy();
+        return;
+      }
+      setRestartStatus("服务可访问，正在确认是否已完成重启。","sub-text warn");
+    }catch(e){
+      setRestartStatus("服务正在重启，等待恢复连接。","sub-text warn");
+    }
+  }
+  setRestartStatus("暂未确认服务恢复，请稍后刷新部署管理或查看控制台日志。","sub-text warn");
+}
+async function serviceControl(action){try{const d=await api("POST","/v1/admin/service/"+action);if(d.accepted){setRestartStatus(d.message||"服务控制命令已触发。","sub-text warn");if(action==="start"||action==="restart")waitServiceRecovery(d.started_at);}else{setRestartStatus((d.message||"未执行服务控制")+" "+(d.reason||""),"sub-text warn");} }catch(e){setRestartStatus(e.message,"sub-text err");alert(e.message);}}
+async function serviceRestart(){return serviceControl("restart");}
+
+function fillDebugPersons(){if(!$("debugPerson"))return;$("debugPerson").innerHTML=['<option value="">访客/未指定</option>'].concat(state.persons.map(p=>`<option value="${esc(p.person_id)}">${esc(p.display_name||p.person_id)}</option>`)).join("");}
+async function runRecallDebug(){const query=$("debugQuery").value.trim();if(!query)return alert("请输入测试问题");try{const d=await api("POST","/v1/admin/debug/recall",{query,person_id:$("debugPerson").value});$("debugResult").className="panel";$("debugResult").innerHTML=`<div class="ops-grid">${Object.entries(d.prompt_summary||{}).map(([k,v])=>`<div class="card"><div class="label">${esc(k)}</div><div class="value">${esc(v)}</div></div>`).join("")}</div><div class="panel" style="margin-top:14px"><pre class="mono">${esc(JSON.stringify(d,null,2))}</pre></div>`;}catch(e){$("debugResult").className="empty";$("debugResult").textContent=e.message;}}
+
+function confirmDelete(title,text,cb){$("confirmTitle").textContent=title;$("confirmText").textContent=text;openModal("confirmModal");$("confirmOkBtn").onclick=async()=>{closeModal("confirmModal");await cb();};}
+
+async function loadGraph(){try{const data=await api("GET","/v1/admin/graph");state.graph=data;renderGraph(data);}catch(e){$("graphCanvas").innerHTML=`<div class="empty" style="margin:18px">${esc(e.message)}</div>`;}}
+function renderGraph(data){
+  if(!data)return;
+  const wrap=$("graphCanvas");wrap.innerHTML="";
+  if(state.graphObjects?.raf)cancelAnimationFrame(state.graphObjects.raf);
+  const graph=filterGraph(data), nodes=graph.nodes, links=graph.links, counts=countGraphTypes(nodes,links);
+  $("graphStats").innerHTML=[
+    ["节点",nodes.length,"记忆人物"],
+    ["连线",links.length,"关系"],
+    ["结构",`${counts.person} / ${counts.contact}`,"实名 / 第三方"]
+  ].map(x=>`<div class="graph-stat"><div class="label">${x[0]}</div><div class="value">${x[1]}</div><div class="sub-text">${x[2]}</div></div>`).join("");
+  $("graphDetail").innerHTML='<h3>节点详情</h3><div class="sub-text">点击节点查看记忆、会话与标签。</div>';
+  const canvas=document.createElement("canvas"), ctx=canvas.getContext("2d"), dpr=Math.min(2,window.devicePixelRatio||1);
+  const rect=wrap.getBoundingClientRect(), w=rect.width, h=rect.height;
+  canvas.width=w*dpr;canvas.height=h*dpr;canvas.style.width=w+"px";canvas.style.height=h+"px";wrap.appendChild(canvas);
+  const sim=buildObsidianGraph(nodes,links,w,h);
+  let zoom=1, panX=0, panY=0, dragging=null, last=null, moved=false, hover=null;
+  canvas.addEventListener("pointerdown",e=>{const p=toWorld(e);dragging=hitNode(p)||{pan:true};last={x:e.clientX,y:e.clientY};moved=false;if(dragging&&!dragging.pan)dragging.fixed=true;});
+  canvas.addEventListener("pointermove",e=>{const p=toWorld(e);hover=hitNode(p);canvas.style.cursor=dragging?(dragging.pan?"grabbing":"grabbing"):(hover?"pointer":"grab");if(!dragging||!last)return;const dx=(e.clientX-last.x)/zoom,dy=(e.clientY-last.y)/zoom;moved=moved||Math.abs(dx)+Math.abs(dy)>1.5;if(dragging.pan){panX+=e.clientX-last.x;panY+=e.clientY-last.y;}else{dragging.x+=dx;dragging.y+=dy;dragging.vx=0;dragging.vy=0;}last={x:e.clientX,y:e.clientY};});
+  canvas.addEventListener("pointerup",e=>{if(dragging&&!dragging.pan)dragging.fixed=false;if(!moved){const hit=hitNode(toWorld(e));if(hit)renderGraphDetail(hit.raw);}dragging=null;last=null;});
+  canvas.addEventListener("wheel",e=>{e.preventDefault();const old=zoom;zoom=Math.max(.45,Math.min(2.4,zoom*(e.deltaY<0?1.08:.92)));const mx=e.offsetX,my=e.offsetY;panX=mx-(mx-panX)*(zoom/old);panY=my-(my-panY)*(zoom/old);},{passive:false});
+  function toWorld(e){return {x:(e.offsetX-panX)/zoom,y:(e.offsetY-panY)/zoom};}
+  function hitNode(p){for(let i=sim.nodes.length-1;i>=0;i--){const n=sim.nodes[i];if(Math.hypot(p.x-n.x,p.y-n.y)<=n.r+8)return n;}return null;}
+  function frame(t){stepGraph(sim);drawObsidianGraph(ctx,sim,w,h,zoom,panX,panY,t,hover);state.graphObjects.raf=requestAnimationFrame(frame);}
+  state.graphObjects={canvas,raf:requestAnimationFrame(frame)};
+}
+let graphResizeTimer=null;
+window.addEventListener("resize",()=>{
+  if(!state.graph || !$("tab-graph")?.classList.contains("active"))return;
+  clearTimeout(graphResizeTimer);
+  graphResizeTimer=setTimeout(()=>renderGraph(state.graph),180);
+});
+function filterGraph(data){
+  const allNodes=data.nodes||[], allLinks=data.links||[], cat=$("graphCategoryFilter")?.value||"", rel=$("graphEmotionFilter")?.value||"", days=Number($("graphTimeFilter")?.value||0), weight=$("graphWeightFilter")?.value||"";
+  const now=Date.now(), visible=new Set();
+  allNodes.forEach(n=>{let ok=true;if(cat&&n.category!==cat&&n.type!=="robot")ok=false;if(days&&n.type!=="robot"){const t=Date.parse(n.last_interaction||"");if(!t||now-t>days*86400000)ok=false;}if(weight==="high"&&n.type!=="robot"&&Number(n.memory_weight||0)<8)ok=false;if(weight==="active"&&n.type!=="robot"&&Number(n.interaction_count||0)<2)ok=false;if(ok)visible.add(n.id);});
+  let links=allLinks.filter(l=>visible.has(l.source)&&visible.has(l.target)&&(!rel||l.relation_style===rel));
+  if(rel){visible.clear();links.forEach(l=>{visible.add(l.source);visible.add(l.target);});const robot=allNodes.find(n=>n.type==="robot");if(robot)visible.add(robot.id);}
+  return {nodes:allNodes.filter(n=>visible.has(n.id)),links};
+}
+function countGraphTypes(nodes,links){return {robot:nodes.filter(n=>n.type==="robot").length,person:nodes.filter(n=>n.type==="person").length,contact:nodes.filter(n=>n.type==="contact").length,links:links.length};}
+function relationVisual(style){return {close:{color:"#9f9f9a",width:1.15,alpha:.42},daily:{color:"#b8bec4",width:.9,alpha:.34},conflict:{color:"#a88f9e",width:1.1,alpha:.38},stranger:{color:"#d2d5d7",width:.7,alpha:.28}}[style]||{color:"#c7cbce",width:.85,alpha:.32};}
+function buildObsidianGraph(rawNodes,rawLinks,w,h){
+  const center={x:w*.48,y:h*.52}, byId={};
+  const nodes=rawNodes.map((raw,i)=>{const weight=Number(raw.memory_weight||0),freq=Number(raw.interaction_count||0),angle=(Math.PI*2*i/Math.max(rawNodes.length,1))-Math.PI/2,rad=raw.type==="robot"?0:120+Math.sqrt(i+1)*54;const r=raw.type==="robot"?12:Math.max(6,Math.min(13,6+Math.sqrt(weight+freq)*.55));const n={raw,id:raw.id,label:raw.label,type:raw.type,r,x:center.x+Math.cos(angle)*rad,y:center.y+Math.sin(angle)*rad,vx:0,vy:0,fixed:false};byId[n.id]=n;return n;});
+  const links=rawLinks.map(l=>({raw:l,source:byId[l.source],target:byId[l.target]})).filter(l=>l.source&&l.target);
+  return {nodes,links,w,h,center};
+}
+function stepGraph(sim){
+  const nodes=sim.nodes, links=sim.links;
+  for(const n of nodes){if(n.fixed)continue;const dx=sim.center.x-n.x,dy=sim.center.y-n.y;n.vx+=dx*.00025;n.vy+=dy*.00025;}
+  for(let i=0;i<nodes.length;i++)for(let j=i+1;j<nodes.length;j++){const a=nodes[i],b=nodes[j],dx=b.x-a.x,dy=b.y-a.y,d2=Math.max(80,dx*dx+dy*dy),f=620/d2,fx=dx*f,fy=dy*f;if(!a.fixed){a.vx-=fx;a.vy-=fy}if(!b.fixed){b.vx+=fx;b.vy+=fy}}
+  for(const l of links){const a=l.source,b=l.target,dx=b.x-a.x,dy=b.y-a.y,d=Math.max(1,Math.hypot(dx,dy)),ideal=a.type==="robot"?170:135,f=(d-ideal)*.0045,fx=dx/d*f,fy=dy/d*f;if(!a.fixed){a.vx+=fx;a.vy+=fy}if(!b.fixed){b.vx-=fx;b.vy-=fy}}
+  for(const n of nodes){if(n.fixed)continue;n.vx*=.86;n.vy*=.86;n.x+=n.vx;n.y+=n.vy;}
+}
+function drawObsidianGraph(ctx,sim,w,h,zoom,panX,panY,t,hover){
+  const dpr=Math.min(2,window.devicePixelRatio||1);
+  ctx.save();ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);ctx.fillStyle="#dfe8df";ctx.fillRect(0,0,w,h);drawPaperNoise(ctx,w,h);ctx.translate(panX,panY);ctx.scale(zoom,zoom);
+  for(const l of sim.links){const style=relationVisual(l.raw.relation_style),a=l.source,b=l.target;ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.strokeStyle=hexToRgba(style.color,style.alpha);ctx.lineWidth=style.width;ctx.stroke();}
+  drawRelationLabels(ctx,sim.links,zoom);
+  ctx.font="12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";ctx.textAlign="center";ctx.textBaseline="top";
+  for(const n of sim.nodes){const pulse=1+Math.sin(t*.002+n.x*.03)*.08,active=n===hover,rr=n.r*pulse*(active?1.18:1);ctx.beginPath();ctx.arc(n.x,n.y,rr+(active?8:4),0,Math.PI*2);ctx.fillStyle=n.type==="robot"?"rgba(70,73,76,.08)":"rgba(70,73,76,.045)";ctx.fill();ctx.beginPath();ctx.arc(n.x,n.y,rr,0,Math.PI*2);ctx.fillStyle=n.type==="robot"?"#4b4e51":(n.type==="person"?"#5a5d60":"#686b6e");ctx.fill();ctx.fillStyle="#6f7377";ctx.fillText(String(n.label||"").slice(0,18),n.x,n.y+rr+8);}
+  ctx.restore();
+}
+function drawRelationLabels(ctx,links,zoom){
+  ctx.save();ctx.font="10.5px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";ctx.textAlign="center";ctx.textBaseline="middle";
+  for(const l of links){const text=String(l.raw.label||l.raw.type||"").slice(0,12);if(!text)continue;const a=l.source,b=l.target,mx=(a.x+b.x)/2,my=(a.y+b.y)/2,dx=b.x-a.x,dy=b.y-a.y,len=Math.max(1,Math.hypot(dx,dy));const nx=-dy/len,ny=dx/len,x=mx+nx*10,y=my+ny*10;const tw=ctx.measureText(text).width+12;ctx.fillStyle="rgba(217,228,219,.78)";roundCanvasRect(ctx,x-tw/2,y-9,tw,18,9);ctx.fill();ctx.fillStyle="rgba(74,83,78,.72)";ctx.fillText(text,x,y+.2);}
+  ctx.restore();
+}
+function roundCanvasRect(ctx,x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();}
+function drawPaperNoise(ctx,w,h){ctx.fillStyle="rgba(0,0,0,.018)";for(let i=0;i<90;i++){const x=(i*97)%w,y=(i*53)%h;ctx.fillRect(x,y,1,1);}}
+function hexToRgba(hex,a){const v=parseInt(hex.slice(1),16);return `rgba(${(v>>16)&255},${(v>>8)&255},${v&255},${a})`;}
+function renderGraphDetail(n){
+  const memory=n.memory||{}, basic=n.basic||{}, profile=n.profile||{};
+  const metrics={...basic,"记忆权重":n.memory_weight??0,"互动频率":n.interaction_count??0,"最近互动":(n.last_interaction||"").slice(0,16)};
+  const kv=Object.entries(metrics).filter(([,v])=>String(v||"").trim()).map(([k,v])=>`<div class="kv-row"><span>${esc(k)}</span><span>${esc(v)}</span></div>`).join("")||'<div class="sub-text">暂无基本信息</div>';
+  const profileBits=[["别名",profile.aliases],["性格",profile.personality],["经历",profile.experiences],["备注",profile.notes]].map(([k,v])=>Array.isArray(v)&&v.length?`<div class="kv-row"><span>${k}</span><span>${esc(v.slice(0,4).join("；"))}</span></div>`:"").join("");
+  $("graphDetail").innerHTML=`<h3>${esc(n.label)}</h3><div class="pid">${esc(n.type)} ${esc(n.person_id||"")}</div><div class="graph-section"><div class="graph-section-title">基本信息</div><div class="kv">${kv}${profileBits}</div></div><div class="graph-section"><div class="graph-section-title">记忆记录</div>${renderMemorySnippets(memory)}</div>`;
+}
+function renderMemorySnippets(memory){
+  const core=(memory.core||[]).map(x=>`<div class="memory-snippet"><span class="tag accent">${esc(x.category_label||x.category||"核心")}</span>${esc(x.content||"")}</div>`).join("");
+  const episodes=(memory.episodes||[]).map(x=>`<div class="memory-snippet"><span class="tag">情景</span>${esc((x.summary||"").slice(0,160))}<div class="pid">${esc((x.created_at||"").slice(0,16))}</div></div>`).join("");
+  const longTerm=(memory.long_term||[]).map(x=>`<div class="memory-snippet"><span class="tag">长期</span>${esc((x.text||"").slice(0,180))}</div>`).join("");
+  return core||episodes||longTerm ? core+episodes+longTerm : '<div class="sub-text">暂无可展示记忆</div>';
+}
+
+// ═══ 变更审计 ═══
+async function loadAuditLog(){
+  const kind=$("auditKindFilter")?.value||"";
+  const days=$("auditDaysFilter")?.value||"7";
+  $("auditContent").innerHTML='<div class="loading"><span class="spin"></span> 加载审计日志</div>';
+  try{
+    const params=new URLSearchParams({limit:"200",days_back:days});
+    if(kind)params.set("kind",kind);
+    const d=await api("GET","/v1/admin/audit-log?"+params.toString());
+    const entries=d.entries||[];
+    const stats=d.stats||{};
+    if(!entries.length){$("auditContent").innerHTML='<div class="empty">暂无审计记录</div>';return;}
+    $("auditContent").innerHTML=
+      '<div style="display:flex;gap:14px;margin-bottom:14px;flex-wrap:wrap;">'+
+        `<div class="card" style="min-height:auto;padding:10px 14px;"><div class="label">7天总操作</div><div class="value">${stats.total||0}</div></div>`+
+        `<div class="card" style="min-height:auto;padding:10px 14px;"><div class="label">今日</div><div class="value">${stats.today||0}</div></div>`+
+        Object.entries(stats.by_kind||{}).slice(0,6).map(([k,v])=>`<div class="card" style="min-height:auto;padding:10px 14px;"><div class="label">${esc(k)}</div><div class="value warn">${v}</div></div>`).join("")+
+      '</div>'+
+      '<div class="table-wrap"><table><thead><tr><th>时间</th><th>类型</th><th>操作</th><th>详情</th></tr></thead><tbody>'+
+      entries.map(e=>{
+        const kindCls={config:"accent",persona:"",memory:"",task:"",service:"warn",backup:"",deploy:""}[e.kind]||"";
+        return `<tr><td style="white-space:nowrap;font-size:.7rem;">${esc((e.ts||"").slice(5,19))}</td>`+
+          `<td><span class="tag${kindCls?' '+kindCls:''}">${esc(e.kind)}</span></td>`+
+          `<td>${esc((e.action||"").slice(0,60))}</td>`+
+          `<td class="mono" style="max-width:320px;font-size:.68rem">${esc((e.detail||"").slice(0,120))}</td></tr>`;
+      }).join("")+
+      '</tbody></table></div>';
+  }catch(e){
+    $("auditContent").innerHTML=`<div class="empty">${esc(e.message)}</div>`;
+  }
+}
+
+// ═══ 人物详情页 ═══
+async function openPersonDetail(personId){
+  $("personDetailModal").classList.add("active");
+  $("pdName").textContent="加载中...";
+  $("pdPersonId").textContent=personId;
+  try{
+    const d=await api("GET",`/v1/admin/persons/${encodeURIComponent(personId)}/detail`);
+    if(!d){throw new Error("人物不存在");}
+    const person=d.person||{};
+    $("pdName").textContent=person.display_name||person.person_id;
+    $("pdPersonId").textContent=person.person_id;
+    state._pdData=d;
+    // Summary cards
+    const ses=d.sessions||{};
+    $("pdSummaryCards").innerHTML=[
+      ["画像字段",Object.keys(d.profile||{}).filter(k=>d.profile[k]&&Array.isArray(d.profile[k])?d.profile[k].length:true).length,"profile"],
+      ["核心记忆",(d.core_memory||[]).length,"core"],
+      ["情景摘要",(d.recent_episodes||[]).length,"recent"],
+      ["长期记忆",(d.long_term_memory||[]).length,"longTerm"],
+      ["第三方画像",(d.contacts||[]).length,"contact"],
+      ["会话",ses.total_sessions||0,`${ses.total_messages||0} 条消息`],
+    ].map(c=>`<div class="card" style="cursor:pointer;min-height:auto;padding:14px;" onclick="showPdSection('${c[2]}')"><div class="label">${c[0]}</div><div class="value">${c[1]}</div></div>`).join(" ");
+    // Profile
+    const pf=d.profile||{};
+    const pfHTML=[];
+    if(pf.display_name)pfHTML.push(`显示名: ${esc(pf.display_name)}`);
+    if(pf.relationship)pfHTML.push(`关系: ${esc(pf.relationship)}`);
+    if(pf.aliases?.length)pfHTML.push(`别名: ${esc(pf.aliases.join(", "))}`);
+    if(pf.personality?.length)pfHTML.push(`性格: ${esc(pf.personality.join(", "))}`);
+    if(pf.experiences?.length)pfHTML.push(`经历: ${esc(pf.experiences.slice(0,3).join("；"))}`);
+    if(pf.emotional_habit?.length)pfHTML.push(`情绪习惯: ${esc(pf.emotional_habit.slice(0,3).join("；"))}`);
+    $("pdProfileContent").innerHTML=pfHTML.length?pfHTML.map(h=>`<div style="padding:3px 0;">${h}</div>`).join(""):"<span style='color:var(--muted)'>暂无画像数据</span>";
+    // Core
+    const core=d.core_memory||[];
+    $("pdCoreContent").innerHTML=core.length?core.map(i=>`<div class="mini-item"><span class="tag accent">${esc(i.kind||i.category||"")}</span>${esc(i.content||"")}</div>`).join(""):'<div class="empty">暂无核心记忆</div>';
+    // Recent
+    const recent=d.recent_episodes||[];
+    $("pdRecentContent").innerHTML=recent.length?recent.map(i=>`<div class="mini-item"><span class="tag accent">${esc(i.kind||"近期")}</span>${esc((i.content||"").slice(0,240))}<div class="pid">${esc(i.created_at||"")}</div></div>`).join(""):'<div class="empty">暂无近期记忆</div>';
+    // LongTerm
+    const longTerm=d.long_term_memory||[];
+    $("pdLongTermContent").innerHTML=longTerm.length?longTerm.map(i=>`<div class="mini-item"><span class="tag accent">${esc(i.kind||i.category||"")}</span>${esc((i.content||i.text||"").slice(0,300))}<div class="pid">${esc(i.id||"").slice(0,20)}</div></div>`).join(""):'<div class="empty">暂无长期记忆</div>';
+    // Contacts
+    const ct=d.contacts||[];
+    $("pdContactContent").innerHTML=ct.length?ct.map(c=>`<div class="mini-item"><span class="tag accent">${esc(c.display_name)}</span>${esc(c.relationship)}<div class="pid">${esc(c.person_id)}</div></div>`).join(""):'<div class="empty">暂无第三方画像</div>';
+    // Sessions
+    $("pdSessionContent").innerHTML=`<div class="ops-grid"><div class="card"><div class="label">总会话</div><div class="value">${ses.total_sessions||0}</div></div><div class="card"><div class="label">活跃</div><div class="value">${ses.active_sessions||0}</div></div><div class="card"><div class="label">已关闭</div><div class="value">${ses.closed_sessions||0}</div></div><div class="card"><div class="label">消息总数</div><div class="value">${ses.total_messages||0}</div></div><div class="card"><div class="label">最后活跃</div><div class="value">${(ses.last_active||"").slice(0,16)||"未知"}</div></div></div>`||'<div class="empty">暂无会话数据</div>';
+    // Audit changes
+    const changes=d.recent_changes||[];
+    $("pdAuditContent").innerHTML=changes.length?changes.map(c=>`<div class="mini-item"><span class="tag">${esc(c.kind||"")}</span>${esc((c.action||"").slice(0,80))}<div class="pid">${esc((c.ts||"").slice(0,16))}</div></div>`).join(""):'<div class="empty">无最近变更</div>';
+    // Relations
+    const rel=d.relations||[];
+    $("pdRelationsContent").innerHTML=rel.length?rel.map(r=>`<div class="mini-item"><span class="tag accent">${esc(r.display_name)}</span>${esc(r.relationship)} <span class="tag">${r.direction==='outgoing'?'→':'←'}</span><div class="pid">${esc(r.person_id)}</div></div>`).join(""):'<div class="empty">暂无关系数据</div>';
+    showPdSection('overview');
+  }catch(e){
+    $("pdName").textContent="加载失败";
+    $("pdSummaryCards").innerHTML=`<div class="empty">${esc(e.message)}</div>`;
+  }
+}
+function showPdSection(section){
+  const sections=["overview","core","recent","longTerm","contact","session","audit","relations"];
+  sections.forEach(s=>{
+    const el=$("pd"+s.charAt(0).toUpperCase()+s.slice(1));
+    if(el)el.style.display=s===section?"block":"none";
+    const tab=$("pdTab"+s.charAt(0).toUpperCase()+s.slice(1));
+    if(tab){
+      tab.style.background=s===section?"var(--accent)":"";
+      tab.style.color=s===section?"#082018":"";
+    }
+  });
+}
+function openPdProfileEditor(){
+  if(!state._pdData)return;
+  const pid=(state._pdData.person||{}).person_id;
+  openProfileEditor(pid,(state._pdData.person||{}).display_name||pid);
+}
+
+if(token) refreshAll(); else loadOverview();
+</script>
+</body>
+</html>

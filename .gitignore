@@ -10,11 +10,18 @@ personal-agent-backend/.env.*
 personal-agent-backend/chroma_data/
 personal-agent-backend/es_data/
 personal-agent-backend/*.db
+personal-agent-backend/*.db-shm
+personal-agent-backend/*.db-wal
+personal-agent-backend/app/*.db
+personal-agent-backend/app/*.db-shm
+personal-agent-backend/app/*.db-wal
 personal-agent-backend/agent.db
 personal-agent-backend/*.sqlite
 personal-agent-backend/*.sqlite3
 personal-agent-backend/*.log
 personal-agent-backend/.pytest_cache/
+personal-agent-backend/.codegraph/
+personal-agent-backend/test_output.*
 
 # Python
 __pycache__/

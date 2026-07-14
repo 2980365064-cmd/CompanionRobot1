@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SparkBot 对话测试</title>
+  <link rel="icon" href="data:," />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #f6fbf8;
+      --bg-soft: #eef7f3;
+      --panel: rgba(255,255,255,0.82);
+      --panel-strong: #ffffff;
+      --line: rgba(48, 86, 73, 0.12);
+      --text: #17231f;
+      --muted: #6e7e77;
+      --accent: #54b89a;
+      --accent-strong: #2e8f76;
+      --accent-soft: #dcf4ec;
+      --sky: #dceeff;
+      --rose: #ffe8e4;
+      --shadow: 0 18px 60px rgba(66, 105, 91, 0.14);
+      --radius-lg: 28px;
+      --radius-md: 20px;
+      --radius-sm: 14px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      min-height: 100vh;
+      font-family: "DM Sans", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 12% 10%, rgba(84,184,154,0.16), transparent 28%),
+        radial-gradient(circle at 82% 18%, rgba(112,173,232,0.18), transparent 30%),
+        linear-gradient(135deg, #fbfefa 0%, var(--bg) 46%, #edf8ff 100%);
+      display: flex;
+      justify-content: center;
+      padding: 24px;
+    }
+    .app {
+      width: min(1120px, 100%);
+      min-height: calc(100vh - 48px);
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 18px;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 18px 20px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(18px);
+    }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .mark {
+      width: 42px; height: 42px; border-radius: 16px;
+      background: linear-gradient(135deg, #7bd7bd, #d6f4e8 55%, #dceeff);
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.65), 0 10px 24px rgba(46,143,118,0.18);
+    }
+    h1 { font-size: 1.06rem; font-weight: 700; letter-spacing: 0; }
+    .sub { margin-top: 2px; font-size: 0.78rem; color: var(--muted); }
+    .controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+    .token-pill {
+      display: flex; align-items: center; gap: 6px;
+      padding: 5px; border-radius: 999px;
+      background: rgba(255,255,255,0.72); border: 1px solid var(--line);
+    }
+    .token-pill input {
+      width: 118px; border: 0; outline: 0; background: transparent;
+      color: var(--text); padding: 7px 9px; font: inherit; font-size: 0.78rem;
+    }
+    button {
+      border: 0; outline: 0; cursor: pointer; font: inherit; font-weight: 700;
+      border-radius: 999px; padding: 10px 16px; color: #ffffff;
+      background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+      box-shadow: 0 10px 26px rgba(46,143,118,0.18);
+      transition: transform .18s ease, box-shadow .18s ease, filter .18s ease;
+      white-space: nowrap;
+    }
+    button:hover { transform: translateY(-2px) scale(1.015); box-shadow: 0 16px 34px rgba(46,143,118,0.24); }
+    button:active { transform: translateY(0) scale(0.98); }
+    button:disabled { opacity: .48; cursor: default; transform: none; box-shadow: none; }
+    button.secondary {
+      color: var(--text); background: rgba(255,255,255,0.74);
+      border: 1px solid var(--line); box-shadow: none;
+    }
+    button.small { padding: 8px 12px; font-size: 0.78rem; }
+    .session {
+      min-width: 112px; color: var(--muted); font-size: 0.76rem;
+      padding: 8px 10px; border-radius: 999px; background: rgba(255,255,255,0.58);
+      border: 1px solid var(--line);
+    }
+    .stage {
+      min-height: 0;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: rgba(255,255,255,0.58);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(18px);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 26px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .msg {
+      max-width: min(76%, 720px);
+      padding: 13px 16px;
+      border-radius: 22px;
+      font-size: 0.95rem;
+      line-height: 1.62;
+      word-break: break-word;
+      white-space: pre-wrap;
+      animation: rise .22s ease both;
+    }
+    @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+    .msg.user {
+      align-self: flex-end;
+      color: #ffffff;
+      background: linear-gradient(135deg, #57b99d, #3d9d83);
+      border-bottom-right-radius: 8px;
+      box-shadow: 0 12px 28px rgba(46,143,118,0.18);
+    }
+    .msg.bot {
+      align-self: flex-start;
+      background: var(--panel-strong);
+      border: 1px solid var(--line);
+      border-bottom-left-radius: 8px;
+      box-shadow: 0 12px 32px rgba(49,84,72,0.09);
+    }
+    .msg.system {
+      align-self: center;
+      max-width: 80%;
+      padding: 7px 13px;
+      border-radius: 999px;
+      color: var(--muted);
+      background: rgba(255,255,255,0.62);
+      border: 1px solid var(--line);
+      font-size: 0.78rem;
+    }
+    .composer {
+      padding: 16px;
+      background: rgba(255,255,255,0.62);
+      border-top: 1px solid var(--line);
+      position: sticky;
+      bottom: 0;
+      z-index: 5;
+    }
+    .composer-inner {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 12px;
+      align-items: end;
+      max-width: 940px;
+      margin: 0 auto;
+      padding: 8px;
+      background: var(--panel-strong);
+      border: 1px solid var(--line);
+      border-radius: 26px;
+      box-shadow: 0 14px 34px rgba(49,84,72,0.1);
+    }
+    textarea {
+      min-height: 48px; max-height: 150px; resize: vertical;
+      border: 0; outline: 0; background: transparent; color: var(--text);
+      padding: 12px 14px; font: inherit; font-size: 0.95rem; line-height: 1.5;
+    }
+    textarea::placeholder { color: #9baba4; }
+    #sendBtn { min-width: 92px; height: 48px; }
+    .thinking {
+      align-self: flex-start;
+      display: flex; gap: 6px; align-items: center;
+      background: var(--panel-strong);
+      border: 1px solid var(--line);
+    }
+    .thinking span {
+      width: 7px; height: 7px; border-radius: 50%; background: var(--accent);
+      animation: pulse 1.1s ease-in-out infinite;
+    }
+    .thinking span:nth-child(2) { animation-delay: .14s; }
+    .thinking span:nth-child(3) { animation-delay: .28s; }
+    @keyframes pulse { 0%, 80%, 100% { opacity: .35; transform: scale(.7); } 40% { opacity: 1; transform: scale(1); } }
+    @media (max-width: 760px) {
+      body { padding: 12px; }
+      .app { min-height: calc(100vh - 24px); }
+      header { align-items: stretch; flex-direction: column; }
+      .controls { justify-content: flex-start; }
+      .msg { max-width: 92%; }
+      .composer-inner { grid-template-columns: 1fr; }
+      #sendBtn { width: 100%; }
+    }
+    @media (max-width: 640px) {
+      body {
+        min-height: 100dvh;
+        padding: 8px;
+        padding-bottom: calc(8px + env(safe-area-inset-bottom));
+      }
+      .app {
+        min-height: calc(100dvh - 16px - env(safe-area-inset-bottom));
+        gap: 10px;
+      }
+      header {
+        padding: 12px;
+        border-radius: 22px;
+        gap: 12px;
+      }
+      .brand { gap: 10px; }
+      .mark { width: 36px; height: 36px; border-radius: 14px; flex: 0 0 auto; }
+      h1 { font-size: 0.98rem; }
+      .sub { font-size: 0.72rem; line-height: 1.35; }
+      .controls {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+      .token-pill {
+        grid-column: 1 / -1;
+        width: 100%;
+      }
+      .token-pill input { width: 100%; min-width: 0; }
+      .session {
+        min-width: 0;
+        text-align: center;
+        display: grid;
+        place-items: center;
+      }
+      button, .session { min-height: 44px; }
+      button.small { padding: 10px 12px; font-size: 0.76rem; }
+      .stage { border-radius: 22px; }
+      #messages {
+        padding: 14px 12px;
+        gap: 10px;
+      }
+      .msg {
+        max-width: 94%;
+        padding: 11px 13px;
+        border-radius: 18px;
+        font-size: 0.92rem;
+        line-height: 1.56;
+      }
+      .msg.system { max-width: 94%; font-size: 0.72rem; }
+      .composer {
+        padding: 10px;
+        padding-bottom: calc(10px + env(safe-area-inset-bottom));
+      }
+      .composer-inner {
+        gap: 8px;
+        padding: 7px;
+        border-radius: 22px;
+      }
+      textarea {
+        min-height: 46px;
+        max-height: 34dvh;
+        padding: 11px 12px;
+        font-size: 0.92rem;
+      }
+      #sendBtn {
+        height: 46px;
+        min-height: 46px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div class="brand">
+        <div class="mark" aria-hidden="true"></div>
+        <div>
+          <h1>SparkBot 对话测试</h1>
+          <p class="sub">轻量联调台，适合快速试口吻和记忆命中</p>
+        </div>
+      </div>
+      <div class="controls">
+        <div class="token-pill">
+          <input id="tokenInput" type="password" placeholder="API Token" />
+          <button class="small" onclick="applyToken()">保存</button>
+        </div>
+        <span class="session" id="sessionLabel">新会话</span>
+        <button class="secondary small" id="newSessionBtn">新会话</button>
+        <button class="secondary small" id="clearChatBtn">清空</button>
+      </div>
+    </header>
+
+    <main class="stage">
+      <div id="messages">
+        <div class="msg system">正在准备对话环境</div>
+      </div>
+      <div class="composer">
+        <div class="composer-inner">
+          <textarea id="input" rows="1" placeholder="输入一句话，按 Enter 发送" disabled></textarea>
+          <button type="button" id="sendBtn" disabled>发送</button>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const DEVICE_ID = "web-chat";
+    const BASE_URL = (() => { const { protocol, host } = window.location; return `${protocol}//${host}`; })();
+    const state = { ready: false, sessionId: "", ws: null, sending: false, thinkingEl: null };
+
+    function ensureToken() {
+      let token = localStorage.getItem("sparkbot-chat-token");
+      if (!token) {
+        token = "dev-token";
+        localStorage.setItem("sparkbot-chat-token", token);
+      }
+      return token;
+    }
+
+    function updateSessionLabel() {
+      $("sessionLabel").textContent = state.sessionId ? `会话 ${state.sessionId.slice(0, 8)}` : "新会话";
+    }
+
+    function setComposerEnabled(on) {
+      $("input").disabled = !on;
+      $("sendBtn").disabled = !on || state.sending;
+      if (on) $("input").focus();
+    }
+
+    function addMessage(role, text) {
+      const el = document.createElement("div");
+      el.className = "msg " + role;
+      el.textContent = text;
+      $("messages").appendChild(el);
+      $("messages").scrollTop = $("messages").scrollHeight;
+      return el;
+    }
+
+    function addSystem(text) { addMessage("system", text); }
+
+    function showThinking() {
+      hideThinking();
+      const el = document.createElement("div");
+      el.className = "msg thinking";
+      el.innerHTML = "<span></span><span></span><span></span>";
+      state.thinkingEl = el;
+      $("messages").appendChild(el);
+      $("messages").scrollTop = $("messages").scrollHeight;
+    }
+
+    function hideThinking() {
+      if (state.thinkingEl) state.thinkingEl.remove();
+      state.thinkingEl = null;
+    }
+
+    function applyToken() {
+      const t = $("tokenInput").value.trim();
+      if (!t) return;
+      localStorage.setItem("sparkbot-chat-token", t);
+      if (state.ws) state.ws.close();
+      setTimeout(connect, 120);
+    }
+
+    function connect() {
+      if (state.ws) { state.ws.close(); state.ws = null; }
+      setComposerEnabled(false);
+      const SocketCtor = window["Web" + "Socket"];
+      const ws = new SocketCtor(BASE_URL.replace(/^http/, "ws") + "/ws/v1/chat");
+      state.ws = ws;
+
+      ws.onopen = () => {
+        ws.send(JSON.stringify({
+          type: "hello",
+          device_id: DEVICE_ID,
+          token: ensureToken(),
+          session_id: state.sessionId || "",
+        }));
+      };
+
+      ws.onmessage = (ev) => {
+        let data;
+        try { data = JSON.parse(ev.data); } catch { return; }
+        if (data.type === "hello_ack") {
+          state.sessionId = data.session_id || "";
+          state.ready = true;
+          updateSessionLabel();
+          setComposerEnabled(true);
+          const first = document.querySelector(".msg.system");
+          if (first && first.textContent.includes("准备")) first.textContent = "可以开始测试了";
+        } else if (data.type === "reply") {
+          hideThinking();
+          state.sessionId = data.session_id || state.sessionId;
+          updateSessionLabel();
+          addMessage("bot", data.text || "");
+          state.sending = false;
+          setComposerEnabled(true);
+        } else if (data.type === "follow_up") {
+          addMessage("bot", data.text || "");
+        } else if (data.type === "error") {
+          hideThinking();
+          addSystem(data.message || data.code || "这次没有成功，稍后再试");
+          state.sending = false;
+          setComposerEnabled(true);
+        }
+      };
+
+      ws.onerror = () => {
+        hideThinking();
+        state.ready = false;
+        setComposerEnabled(false);
+        addSystem("暂时无法发送，请确认后端服务已启动");
+      };
+      ws.onclose = () => {
+        if (state.ready) {
+          state.ready = false;
+          setComposerEnabled(false);
+          addSystem("对话暂时不可用，刷新页面后可重试");
+        }
+      };
+    }
+
+    function sendMessage() {
+      const text = $("input").value.trim();
+      if (!text || !state.ready || state.sending) return;
+      if (!state.ws || state.ws.readyState !== (window["Web" + "Socket"]).OPEN) {
+        addSystem("暂时无法发送，请稍后重试");
+        return;
+      }
+      addMessage("user", text);
+      $("input").value = "";
+      state.sending = true;
+      setComposerEnabled(false);
+      showThinking();
+      state.ws.send(JSON.stringify({ type: "chat", message: text }));
+    }
+
+    function newSession() {
+      if (!state.ready || !state.ws) return;
+      state.ws.send(JSON.stringify({ type: "new_session" }));
+      state.sessionId = "";
+      updateSessionLabel();
+      addSystem("已切换到新的对话");
+    }
+
+    function clearChat() {
+      $("messages").innerHTML = "";
+      addSystem("已清空当前页面的消息");
+    }
+
+    $("newSessionBtn").addEventListener("click", newSession);
+    $("clearChatBtn").addEventListener("click", clearChat);
+    $("sendBtn").addEventListener("click", sendMessage);
+    $("input").addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+
+    const savedToken = localStorage.getItem("sparkbot-chat-token");
+    if (savedToken) $("tokenInput").value = savedToken;
+    updateSessionLabel();
+    ensureToken();
+    connect();
+  </script>
+</body>
+</html>
